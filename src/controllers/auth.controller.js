@@ -2715,16 +2715,17 @@ async function resendPromoterReferralInvite(req, res) {
  * - 410: Referral token expired
  * - 409: Email already registered
  */
+
 async function promoterRegisterViaReferral(req, res) {
   const client = await pool.connect();
   try {
-    const { name, email, password, phone, referral_token } = req.body;
+    const { name, password, phone, referral_token } = req.body;
 
-    // VALIDATION: All fields are required
+    // VALIDATION
     const errors = [];
-    if (!name || typeof name !== "string" || name.trim().length === 0) errors.push("Name is required.");
-    if (!email || (typeof email === "string" && email.trim() === "")) errors.push("Email is required.");
-    if (!isValidEmail(email)) errors.push("Valid email is required.");
+    if (!name || typeof name !== "string" || name.trim().length === 0) {
+      errors.push("Name is required.");
+    }
     if (!password) errors.push("Password is required.");
     if (!phone) errors.push("Phone number is required.");
 
@@ -2733,64 +2734,40 @@ async function promoterRegisterViaReferral(req, res) {
       return res.status(400).json({
         error: true,
         message: "Missing required fields.",
-        data: { 
-          errors,
-          email: email || null
-        },
+        data: { errors },
       });
     }
 
-    // VALIDATION: Password strength
+    // PASSWORD VALIDATION
     const passwordErrors = validatePasswordStrength(password);
     if (passwordErrors.length > 0) {
       client.release();
       return res.status(400).json({
         error: true,
         message: "Password does not meet strength requirements.",
-        data: { 
-          errors: passwordErrors,
-          email
-        },
+        data: { errors: passwordErrors },
       });
     }
 
-    // VALIDATION: Phone format (E.164)
-    const phoneRegex = /^\+[1-9]\d{1,14}$/; // E.164 format
+    // PHONE VALIDATION
+    const phoneRegex = /^\+[1-9]\d{1,14}$/;
     if (!phoneRegex.test(phone)) {
       client.release();
       return res.status(422).json({
         error: true,
         message: "Phone number must be in E.164 format (e.g., +447911123456).",
-        data: { 
-          phone,
-          email
-        },
+        data: { phone },
       });
     }
 
-    // STEP 1: Check if email already exists
-    const existingUserResult = await client.query(
-      "SELECT id FROM users WHERE email = $1",
-      [email]
-    );
-
-    if (existingUserResult.rowCount > 0) {
-      client.release();
-      return res.status(409).json({
-        error: true,
-        message: "Email is already registered.",
-        data: { email },
-      });
-    }
-
-    // STEP 2: Validate referral token if provided
+    // STEP 1: VALIDATE TOKEN
     let guruId = null;
     let guruData = null;
-    let isTimeBasedInvite = false; // Track if it's a new time-limited invitation
+    let isTimeBasedInvite = false;
+    let email = null; // <-- THIS is now controlled by backend
 
     if (referral_token) {
-      // FIRST: Try new time-limited promoter_referral_invites system
-      const newInviteResult = await client.query(
+      const result = await client.query(
         `SELECT pri.*, u.id as user_id, u.name as guru_name
          FROM promoter_referral_invites pri
          JOIN users u ON u.id = pri.guru_user_id
@@ -2798,148 +2775,113 @@ async function promoterRegisterViaReferral(req, res) {
         [referral_token]
       );
 
-      if (newInviteResult.rowCount > 0) {
-        const invite = newInviteResult.rows[0];
-
-        // Check if already used
-        if (invite.used_at) {
-          client.release();
-          return res.status(409).json({
-            error: true,
-            message: "This referral invitation has already been used.",
-            data: { email },
-          });
-        }
-
-        // Check if expired
-        if (new Date(invite.expires_at) < new Date()) {
-          client.release();
-          return res.status(410).json({
-            error: true,
-            message: "This referral invitation has expired. Please ask your Guru to send a new one.",
-            data: { email },
-          });
-        }
-
-        // Check if email matches
-        if (invite.email !== email) {
-          client.release();
-          return res.status(400).json({
-            error: true,
-            message: `This invitation is for ${invite.email}. Please use that email address.`,
-            data: { email },
-          });
-        }
-
-        guruData = invite;
-        guruId = invite.user_id;
-        isTimeBasedInvite = true;
-
-        console.log(`[PROMOTER REGISTER] Valid time-limited referral found for Guru ID: ${guruId}`);
-      } else {
-        // FALLBACK: Try old guru_referrals system for backward compatibility
-        const oldInviteResult = await client.query(
-          `SELECT gr.*, u.id as user_id, u.name as guru_name
-           FROM guru_referrals gr
-           JOIN users u ON u.id = gr.guru_id
-           WHERE gr.referral_code = $1 AND gr.revoked_at IS NULL`,
-          [referral_token]
-        );
-
-        if (oldInviteResult.rowCount === 0) {
-          client.release();
-          return res.status(401).json({
-            error: true,
-            message: "Referral token is invalid.",
-            data: { referral_token },
-          });
-        }
-
-        guruData = oldInviteResult.rows[0];
-        guruId = guruData.user_id;
-        console.log(`[PROMOTER REGISTER] Valid static referral found for Guru ID: ${guruId}`);
+      if (result.rowCount === 0) {
+        client.release();
+        return res.status(401).json({
+          error: true,
+          message: "Referral token is invalid.",
+        });
       }
+
+      const invite = result.rows[0];
+
+      // USED
+      if (invite.used_at) {
+        client.release();
+        return res.status(409).json({
+          error: true,
+          message: "This referral invitation has already been used.",
+        });
+      }
+
+      // EXPIRED
+      if (new Date(invite.expires_at) < new Date()) {
+        client.release();
+        return res.status(410).json({
+          error: true,
+          message: "This referral invitation has expired.",
+        });
+      }
+
+      // ✅ ALWAYS TAKE EMAIL FROM INVITE
+      email = invite.email;
+
+      guruId = invite.user_id;
+      guruData = invite;
+      isTimeBasedInvite = true;
     }
 
-    // STEP 3: Create user record with role = PROMOTER
-    await client.query('BEGIN');
+    // STEP 2: CHECK EXISTING USER (NOW SAFE)
+    const existingUser = await client.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email]
+    );
+
+    if (existingUser.rowCount > 0) {
+      client.release();
+      return res.status(409).json({
+        error: true,
+        message: "Email is already registered.",
+      });
+    }
+
+    // STEP 3: CREATE USER
+    await client.query("BEGIN");
 
     const passwordHash = await bcrypt.hash(password, 12);
 
     const userResult = await client.query(
       `INSERT INTO users (email, password_hash, name, phone, role, status, account_status, email_status, email_verified_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       VALUES ($1, $2, $3, $4, 'promoter', 'active', 'active', 'verified', NOW())
        RETURNING *`,
-      [
-        email,
-        passwordHash,
-        name.trim(),
-        phone,
-        'promoter',
-        'active',
-        'active',
-        'verified' // Email verified immediately for referral registrations
-      ]
+      [email, passwordHash, name.trim(), phone]
     );
 
     const user = userResult.rows[0];
 
-    // STEP 4: Create referral record with 90-day expiry
+    // STEP 4: LINK GURU
     if (guruId) {
-      const referralStartDate = new Date();
-      const referralExpiryDate = new Date(referralStartDate.getTime() + 90 * 24 * 60 * 60 * 1000); // 90 days
-
       await client.query(
         `INSERT INTO promoter_guru_links (promoter_user_id, guru_user_id, source, created_at, changed_at)
-         VALUES ($1, $2, 'referral_link', $3, $4)
-         ON CONFLICT (promoter_user_id) DO UPDATE SET guru_user_id = EXCLUDED.guru_user_id, source = EXCLUDED.source`,
-        [user.id, guruId, referralStartDate, referralStartDate]
+         VALUES ($1, $2, 'referral_link', NOW(), NOW())
+         ON CONFLICT (promoter_user_id) DO UPDATE 
+         SET guru_user_id = EXCLUDED.guru_user_id`,
+        [user.id, guruId]
       );
 
-      // Also create/update promoter_profile if not exists
       await client.query(
         `INSERT INTO promoter_profiles (user_id, guru_id, created_at)
          VALUES ($1, $2, NOW())
          ON CONFLICT (user_id) DO UPDATE SET guru_id = EXCLUDED.guru_id`,
         [user.id, guruId]
       );
-    } else {
-      // Create promoter profile without guru (can be assigned later)
-      await client.query(
-        `INSERT INTO promoter_profiles (user_id, created_at)
-         VALUES ($1, NOW())
-         ON CONFLICT (user_id) DO NOTHING`,
-        [user.id]
-      );
     }
 
-    // STEP 4.5: Mark time-limited referral invite as used (if applicable)
-    if (isTimeBasedInvite && referral_token) {
+    // MARK INVITE USED
+    if (isTimeBasedInvite) {
       await client.query(
         `UPDATE promoter_referral_invites
          SET used_at = NOW()
          WHERE referral_token = $1`,
         [referral_token]
       );
-      console.log(`[PROMOTER REGISTER] ✅ Marked time-limited referral invite as used: ${referral_token.substring(0, 8)}...`);
     }
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
     client.release();
 
-    // STEP 5: Create session with JWT tokens (AFTER commit so user exists in DB)
+    // SESSION
     const session = await createSession({
       userId: user.id,
       ip: req.ip,
       userAgent: req.headers["user-agent"],
-      roles: ['promoter'],
+      roles: ["promoter"],
       rolesVersion: user.roles_version || 1,
     });
 
-    // STEP 6: Return response per API contract
     return res.status(201).json({
       error: false,
-      message: "Promoter registration successful. You are now logged in.",
+      message: "Promoter registration successful.",
       data: {
         access_token: session.accessToken,
         refresh_token: session.refreshToken,
@@ -2948,34 +2890,25 @@ async function promoterRegisterViaReferral(req, res) {
           name: user.name,
           email: user.email,
           phone: user.phone,
-          role: 'promoter',
+          role: "promoter",
           guru_id: guruId || null,
           guru_display_name: guruData?.guru_name || null,
-          referral_start_date: new Date().toISOString().split('T')[0],
-          referral_expiry_date: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-          tickets_sold: 0,
-          unlock_threshold: 575,
         },
-        expires_at: session.expiresAt,
       },
     });
 
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (_) { }
-    try {
-      client.release();
-    } catch (_) { }
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    try { client.release(); } catch (_) {}
+
     console.error("Promoter registration error:", err);
+
     return res.status(500).json({
       error: true,
-      message: "An error occurred during Promoter registration. Please try again later.",
-      data: null,
+      message: "Registration failed. Try again.",
     });
   }
 }
-
 /**
  * GET /api/v1/referrals/validate/:token
  * Validate Referral Token and Return Guru Info (Module 5)
