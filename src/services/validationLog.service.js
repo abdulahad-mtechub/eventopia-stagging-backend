@@ -25,8 +25,9 @@ async function logValidationAttempt({
   resultStatus,
   scannedByUserId = null,
   metadata = {}
-}) {
+}, options = {}) {
   try {
+    const db = options.client || pool;
     const query = `
       INSERT INTO ticket_validation_logs (
         event_id,
@@ -48,7 +49,7 @@ async function logValidationAttempt({
       metadata
     ];
 
-    const result = await pool.query(query, values);
+    const result = await db.query(query, values);
     return result.rows[0].id;
   } catch (err) {
     console.error('Error logging validation attempt:', err);

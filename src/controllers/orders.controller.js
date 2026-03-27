@@ -11,7 +11,7 @@ const { allocateCredit } = require("../services/allocateCredit.service");
 const { resolveTier } = require("../services/tierResolver.service");
 const { logTicketAudit } = require("../services/audit.service");
 const { logValidationAttempt } = require("../services/validationLog.service");
-
+// done data commit?
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
@@ -52,6 +52,8 @@ const verifyQRHash = (hash, payload) => {
   const expected = signQRHash(payload);
   return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(expected, "hex"));
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ─────────────────────────────────────────────
 // SERVICE 1 — POST /orders
@@ -366,9 +368,18 @@ const createOrder = async (req, res) => {
  */
 const confirmOrder = async (req, res) => {
   const client = await pool.connect();
+  const startedAt = Date.now();
   try {
     const orderId = parseInt(req.params.id, 10);
+    console.log("[confirmOrder:start]", {
+      orderId: req.params.id,
+      parsedOrderId: orderId,
+      payment_status: req.body?.payment_status,
+      payment_ref: req.body?.payment_ref,
+      userId: req.user?.id,
+    });
     if (Number.isNaN(orderId) || orderId <= 0) {
+      console.log("[confirmOrder:invalid-order-id]", { orderId: req.params.id, ms: Date.now() - startedAt });
       return fail(res, req, 400, "VALIDATION_ERROR", "Invalid order id");
     }
     const { payment_ref, payment_status } = req.body;
@@ -390,34 +401,139 @@ const confirmOrder = async (req, res) => {
         [orderId]
       );
       await client.query("COMMIT");
+      console.log("[confirmOrder:payment-failure-handled]", { orderId, ms: Date.now() - startedAt });
 
       return fail(res, req, 400, "PAYMENT_FAILED", "Payment failed. Order remains pending. No escrow entry created.");
     }
 
     if (payment_status !== "success") {
+      console.log("[confirmOrder:invalid-payment-status]", { orderId, payment_status, ms: Date.now() - startedAt });
       return fail(res, req, 400, "VALIDATION_ERROR", "payment_status must be 'success' or 'failure'");
     }
 
+    console.log("[confirmOrder:before-begin]", { orderId, ms: Date.now() - startedAt });
     await client.query("BEGIN");
+    console.log("[confirmOrder:after-begin]", { orderId, ms: Date.now() - startedAt });
 
     // ── Fetch order ───────────────────────────────────────────────────────────
-    const orderResult = await client.query(
-      `SELECT
-         o.*,
-         e.territory_id,
-         e.promoter_id,
-         e.guru_id,
-         e.network_manager_id,
-         e.id AS event_id
-       FROM orders o
-       JOIN events e ON e.id = o.event_id
-       WHERE o.id = $1
-       FOR UPDATE`,
-      [orderId]
-    );
+    console.log("[confirmOrder:before-fetch-order-for-update]", { orderId, ms: Date.now() - startedAt });
+    let orderResult;
+    try {
+      orderResult = await client.query(
+        `SELECT
+           o.*,
+           e.territory_id,
+           e.promoter_id,
+           e.guru_id,
+           e.network_manager_id,
+           e.id AS event_id
+         FROM orders o
+         JOIN events e ON e.id = o.event_id
+         WHERE o.id = $1
+         FOR UPDATE NOWAIT`,
+        [orderId]
+      );
+    } catch (lockErr) {
+      // PostgreSQL 55P03 = lock_not_available (row currently locked by another tx)
+      if (lockErr?.code === "55P03") {
+        await client.query("ROLLBACK");
+        console.warn("[confirmOrder:order-row-locked]", { orderId, ms: Date.now() - startedAt });
+
+        // Avoid surfacing an error for normal concurrent confirms.
+        // Return current order state so clients can poll until completed.
+        const currentOrderResult = await pool.query(
+          `SELECT id, status, payment_status, confirmed_at
+           FROM orders
+           WHERE id = $1`,
+          [orderId]
+        );
+
+        if (currentOrderResult.rowCount === 0) {
+          return fail(res, req, 404, "ORDER_NOT_FOUND", "Order not found");
+        }
+
+        const currentOrder = currentOrderResult.rows[0];
+        const isCompleted =
+          currentOrder.payment_status === "paid" ||
+          currentOrder.status === "confirmed" ||
+          !!currentOrder.confirmed_at;
+
+        if (isCompleted) {
+          return ok(
+            res,
+            req,
+            {
+              order: {
+                id: currentOrder.id,
+                status: "completed",
+              },
+              processing: false,
+            },
+            200
+          );
+        }
+
+        // Hide transient lock contention from client:
+        // wait briefly for the in-flight confirmation to finish, then return final status.
+        const maxWaitMs = 6000;
+        const stepMs = 300;
+        let waitedMs = 0;
+        while (waitedMs < maxWaitMs) {
+          await sleep(stepMs);
+          waitedMs += stepMs;
+          const polled = await pool.query(
+            `SELECT id, status, payment_status, confirmed_at
+             FROM orders
+             WHERE id = $1`,
+            [orderId]
+          );
+          if (polled.rowCount === 0) break;
+          const row = polled.rows[0];
+          const done =
+            row.payment_status === "paid" ||
+            row.status === "confirmed" ||
+            !!row.confirmed_at;
+          if (done) {
+            console.log("[confirmOrder:lock-resolved-after-wait]", {
+              orderId,
+              waitedMs,
+              ms: Date.now() - startedAt,
+            });
+            return ok(
+              res,
+              req,
+              {
+                order: {
+                  id: row.id,
+                  status: "completed",
+                },
+                processing: false,
+              },
+              200
+            );
+          }
+        }
+
+        // Fallback if still not complete after short wait window.
+        return fail(
+          res,
+          req,
+          409,
+          "ORDER_PROCESSING",
+          "Order is currently being processed by another request. Please retry shortly."
+        );
+      }
+      throw lockErr;
+    }
+    console.log("[confirmOrder:after-fetch-order-for-update]", {
+      orderId,
+      rowCount: orderResult.rowCount,
+      ms: Date.now() - startedAt,
+    });
 
     if (orderResult.rowCount === 0) {
       await client.query("ROLLBACK");
+      console.log("[confirmOrder:order-not-found]", { orderId, ms: Date.now() - startedAt });
       return fail(res, req, 404, "ORDER_NOT_FOUND", "Order not found");
     }
 
@@ -425,6 +541,7 @@ const confirmOrder = async (req, res) => {
 
     if (order.payment_intent_id !== payment_ref) {
       await client.query("ROLLBACK");
+      console.log("[confirmOrder:payment-ref-mismatch]", { orderId, ms: Date.now() - startedAt });
       return fail(res, req, 400, "VALIDATION_ERROR", "payment_ref does not match order");
     }
 
@@ -433,6 +550,7 @@ const confirmOrder = async (req, res) => {
 
     if (alreadyConfirmed) {
       await client.query("ROLLBACK");
+      console.log("[confirmOrder:already-confirmed]", { orderId, ms: Date.now() - startedAt });
       return fail(res, req, 400, "ALREADY_COMPLETED", "Order already confirmed");
     }
 
@@ -443,6 +561,7 @@ const confirmOrder = async (req, res) => {
     );
 
     // ── Fetch order items (one row per attendee ticket) ─────────────────────
+    console.log("[confirmOrder:before-fetch-order-items]", { orderId, ms: Date.now() - startedAt });
     const itemsResult = await client.query(
       `SELECT
          oi.id AS order_item_id,
@@ -458,6 +577,11 @@ const confirmOrder = async (req, res) => {
        ORDER BY oi.id`,
       [orderId]
     );
+    console.log("[confirmOrder:after-fetch-order-items]", {
+      orderId,
+      itemRows: itemsResult.rowCount,
+      ms: Date.now() - startedAt,
+    });
 
     const responseItems = [];
     const qtyByTicketType = {}; // ticket_type_id -> quantity
@@ -556,17 +680,8 @@ const confirmOrder = async (req, res) => {
       [order.event_id]
     );
 
-    // ── Ledger + projected credit (reuses existing services) ────────────────
-    await receiveTicketPayment({
-      territory_id: order.territory_id || 1,
-      escrow_amount_pence: Number(order.subtotal_amount),
-      booking_fee_pence: Number(order.booking_fee_amount),
-      buyer_id: order.buyer_user_id,
-      order_id: orderId,
-      event_id: order.event_id,
-    });
-
-    // Allocate projected credit per tier label derived from ticket price.
+    // Prepare projected credit inputs now; execute financial side-effects after COMMIT
+    // to reduce lock duration on the order row.
     const qtyByTierLabel = {}; // tier_label -> quantity
     for (const item of itemsResult.rows) {
       const tierPricePounds = Number(item.ticket_price_amount) / 100;
@@ -574,20 +689,57 @@ const confirmOrder = async (req, res) => {
       qtyByTierLabel[tier_label] = (qtyByTierLabel[tier_label] || 0) + (item.quantity || 1);
     }
 
-    for (const [tierLabel, qty] of Object.entries(qtyByTierLabel)) {
-      await allocateCredit({
-        event_id: order.event_id,
-        tier_label: Number(tierLabel),
-        quantity: qty,
-        promoter_id: order.promoter_id,
-        guru_id: order.guru_id,
-        network_manager_id: order.network_manager_id,
+    console.log("[confirmOrder:before-commit]", {
+      orderId,
+      mintedTickets: responseItems.length,
+      distinctTicketTypes: Object.keys(qtyByTicketType).length,
+      ms: Date.now() - startedAt,
+    });
+    await client.query("COMMIT");
+    console.log("[confirmOrder:after-commit]", { orderId, ms: Date.now() - startedAt });
+
+    let escrowEntryCreated = true;
+    try {
+      // ── Post-commit side effects (no order-row lock held) ───────────────────
+      console.log("[confirmOrder:before-receive-ticket-payment]", { orderId, ms: Date.now() - startedAt });
+      await receiveTicketPayment({
         territory_id: order.territory_id || 1,
+        escrow_amount_pence: Number(order.subtotal_amount),
+        booking_fee_pence: Number(order.booking_fee_amount),
+        buyer_id: order.buyer_user_id,
         order_id: orderId,
+        event_id: order.event_id,
+      });
+      console.log("[confirmOrder:after-receive-ticket-payment]", { orderId, ms: Date.now() - startedAt });
+
+      console.log("[confirmOrder:before-allocate-credit-loop]", {
+        orderId,
+        tierCount: Object.keys(qtyByTierLabel).length,
+        ms: Date.now() - startedAt,
+      });
+      for (const [tierLabel, qty] of Object.entries(qtyByTierLabel)) {
+        await allocateCredit({
+          event_id: order.event_id,
+          tier_label: Number(tierLabel),
+          quantity: qty,
+          promoter_id: order.promoter_id,
+          guru_id: order.guru_id,
+          network_manager_id: order.network_manager_id,
+          territory_id: order.territory_id || 1,
+          order_id: orderId,
+        });
+      }
+      console.log("[confirmOrder:after-allocate-credit-loop]", { orderId, ms: Date.now() - startedAt });
+    } catch (sideEffectErr) {
+      escrowEntryCreated = false;
+      console.error("[confirmOrder:post-commit-side-effect-error]", {
+        orderId,
+        message: sideEffectErr?.message,
+        ms: Date.now() - startedAt,
       });
     }
 
-    await client.query("COMMIT");
+    console.log("[confirmOrder:done]", { orderId, ms: Date.now() - startedAt, escrowEntryCreated });
 
     return ok(res, req, {
       order: {
@@ -595,13 +747,18 @@ const confirmOrder = async (req, res) => {
         status: "completed",
         items: responseItems
       },
-      escrow_entry_created: true,
+      escrow_entry_created: escrowEntryCreated,
       confirmation_email_sent: false
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("confirmOrder error:", err);
+    console.error("[confirmOrder:exception]", {
+      orderId: req.params?.id,
+      message: err?.message,
+      ms: Date.now() - startedAt,
+    });
     return res.status(500).json({ error: true, message: err.message || "Internal server error", data: null });
   } finally {
     client.release();
@@ -864,12 +1021,19 @@ const getTicketQR = async (req, res) => {
  */
 const scanTicket = async (req, res) => {
   const client = await pool.connect();
+  const startedAt = Date.now();
   try {
     const eventId = req.params.id;
     const { qr_code_hash } = req.body;
+    console.log("[scanTicket:start]", {
+      eventId,
+      hashPrefix: String(qr_code_hash || "").slice(0, 12),
+      userId: req.user?.id,
+    });
 
     if (!qr_code_hash) {
       // Not a scan error — this is a bad API call; still return 200 with invalid
+      console.log("[scanTicket:missing-hash]", { eventId, ms: Date.now() - startedAt });
       return ok(res, req, {
         valid: false,
         reason: "INVALID_HASH",
@@ -877,8 +1041,11 @@ const scanTicket = async (req, res) => {
       });
     }
 
+    console.log("[scanTicket:before-begin]", { eventId, ms: Date.now() - startedAt });
     await client.query("BEGIN");
+    console.log("[scanTicket:after-begin]", { eventId, ms: Date.now() - startedAt });
 
+    console.log("[scanTicket:before-fetch-ticket-for-update]", { eventId, ms: Date.now() - startedAt });
     const itemResult = await client.query(
       `SELECT
          t.id,
@@ -894,9 +1061,15 @@ const scanTicket = async (req, res) => {
        FOR UPDATE`,
       [qr_code_hash]
     );
+    console.log("[scanTicket:after-fetch-ticket-for-update]", {
+      eventId,
+      rowCount: itemResult.rowCount,
+      ms: Date.now() - startedAt,
+    });
 
     if (itemResult.rowCount === 0) {
       await client.query("ROLLBACK");
+      console.log("[scanTicket:invalid-hash]", { eventId, ms: Date.now() - startedAt });
       return ok(res, req, {
         valid: false,
         reason: "INVALID_HASH",
@@ -909,6 +1082,11 @@ const scanTicket = async (req, res) => {
     // ── WRONG_EVENT ───────────────────────────────────────────────────────────
     if (String(item.event_id) !== String(eventId)) {
       await client.query("ROLLBACK");
+      console.log("[scanTicket:wrong-event]", {
+        requestedEventId: eventId,
+        ticketEventId: item.event_id,
+        ms: Date.now() - startedAt,
+      });
       return ok(res, req, {
         valid: false,
         reason: "WRONG_EVENT",
@@ -919,6 +1097,7 @@ const scanTicket = async (req, res) => {
     // ── ALREADY_USED ──────────────────────────────────────────────────────────
     if (item.ticket_status === "USED") {
       await client.query("ROLLBACK");
+      console.log("[scanTicket:already-used]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
       return ok(res, req, {
         valid: false,
         reason: "ALREADY_USED",
@@ -927,6 +1106,7 @@ const scanTicket = async (req, res) => {
     }
 
     // ── Mark as used ──────────────────────────────────────────────────────────
+    console.log("[scanTicket:before-update-ticket-used]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
     await client.query(
       `UPDATE tickets
        SET status = 'USED',
@@ -937,21 +1117,27 @@ const scanTicket = async (req, res) => {
        WHERE id = $1`,
       [item.id, req.user.id]
     );
+    console.log("[scanTicket:after-update-ticket-used]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
 
     // Record check-in + audit + validation log (existing ticketing services)
+    console.log("[scanTicket:before-insert-checkin]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
     await client.query(
       `INSERT INTO checkins (ticket_id, event_id, promoter_user_id, scanned_at)
        VALUES ($1,$2,$3,NOW())`,
       [item.id, item.event_id, req.user.id]
     );
+    console.log("[scanTicket:after-insert-checkin]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
 
+    console.log("[scanTicket:before-audit-log]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
     await logTicketAudit(req.user.id, item.id, item.event_id, "CHECKED_IN", "ACTIVE", "USED", {
       qr_code_hash,
       ticket_item_id: item.id,
       order_id: item.order_id,
-    });
+    }, { client });
+    console.log("[scanTicket:after-audit-log]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
 
     const sha256 = crypto.createHash("sha256").update(String(qr_code_hash)).digest("hex");
+    console.log("[scanTicket:before-validation-log]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
     await logValidationAttempt({
       eventId: item.event_id,
       ticketId: item.id,
@@ -963,12 +1149,16 @@ const scanTicket = async (req, res) => {
         order_id: item.order_id,
         attendee_name: item.buyer_name,
       },
-    });
+    }, { client });
+    console.log("[scanTicket:after-validation-log]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
 
+    console.log("[scanTicket:before-commit]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
     await client.query("COMMIT");
+    console.log("[scanTicket:done]", { eventId, ticketId: item.id, ms: Date.now() - startedAt });
 
     return ok(res, req, {
       valid: true,
+      message: "QR code verified successfully. Ticket checked in.",
       ticket: {
         id: item.id,
         attendee_name: item.buyer_name,
@@ -980,6 +1170,11 @@ const scanTicket = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("scanTicket error:", err);
+    console.error("[scanTicket:exception]", {
+      eventId: req.params?.id,
+      message: err?.message,
+      ms: Date.now() - startedAt,
+    });
     // Per spec: always 200
     return res.status(200).json({
       error: false,
