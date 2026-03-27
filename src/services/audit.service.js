@@ -16,14 +16,24 @@ const pool = require('../db/index');
  * @param {string|null} afterStatus - New status (null if none)
  * @param {object} metadata - Additional metadata (optional)
  */
-async function logTicketAudit(actorUserId, ticketId, eventId, action, beforeStatus = null, afterStatus = null, metadata = {}) {
+async function logTicketAudit(
+  actorUserId,
+  ticketId,
+  eventId,
+  action,
+  beforeStatus = null,
+  afterStatus = null,
+  metadata = {},
+  options = {}
+) {
   try {
+    const db = options.client || pool;
     const query = `
       INSERT INTO ticket_audit_logs (ticket_id, event_id, actor_user_id, action, before_status, after_status, metadata)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
     `;
 
-    await pool.query(query, [
+    await db.query(query, [
       ticketId,
       eventId,
       actorUserId,
