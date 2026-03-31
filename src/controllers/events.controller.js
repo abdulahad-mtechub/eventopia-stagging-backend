@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { ok, fail } = require("../utils/standardResponse");
 const { logEventChange } = require("../middlewares/audit.middleware");
+const { BUYER_VISIBLE_EVENT_STATUS } = require("../utils/eventStatus");
 const crypto = require("crypto");
 
 /**
@@ -446,6 +447,102 @@ async function setEventTags(req, res) {
 }
 
 /**
+ * Shared validation for submit/publish readiness
+ */
+async function getEventSubmissionMissingFields(client, event, eventId) {
+  const missingFields = [];
+
+  if (!event.title) missingFields.push("title");
+  if (!event.description) missingFields.push("description");
+  if (!event.start_at) missingFields.push("startAt");
+  if (!event.end_at) missingFields.push("endAt");
+  if (!event.city) missingFields.push("city");
+  if (!event.format) missingFields.push("format");
+  if (!event.access_mode) missingFields.push("accessMode");
+
+  // Require at least 1 active ticket type for ticketed or mixed events
+  if (event.access_mode === 'ticketed' || event.access_mode === 'mixed') {
+    const ticketCountResult = await client.query(
+      `SELECT COUNT(*) as count FROM ticket_types WHERE event_id = $1 AND status = 'active'`,
+      [eventId]
+    );
+
+    if (parseInt(ticketCountResult.rows[0].count, 10) === 0) {
+      missingFields.push("At least 1 active ticket type");
+    }
+  }
+
+  return missingFields;
+}
+
+/**
+ * Phase E4: Submit event for admin approval
+ * POST /promoter/events/:eventId/submit
+ */
+async function submitEvent(req, res) {
+  const client = await pool.connect();
+  try {
+    const eventId = validateEventId(req.params.eventId);
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `SELECT status, title, description, start_at, end_at, city, format, access_mode, venue_name, venue_address, cover_image_url
+       FROM events WHERE id = $1 AND promoter_id = $2`,
+      [eventId, req.user.id]
+    );
+
+    if (eventResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Event not found");
+    }
+
+    const event = eventResult.rows[0];
+
+    if (event.status === 'pending_approval') {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Event is already pending approval");
+    }
+
+    if (event.status === 'published') {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Published events cannot be submitted for approval");
+    }
+
+    if (event.status === 'cancelled') {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Cancelled events cannot be submitted for approval");
+    }
+
+    const missingFields = await getEventSubmissionMissingFields(client, event, eventId);
+
+    if (missingFields.length > 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "VALIDATION_FAILED",
+        `Cannot submit for approval. Missing required: ${missingFields.join(", ")}`);
+    }
+
+    await client.query(
+      `UPDATE events SET status = 'pending_approval', updated_at = NOW() WHERE id = $1`,
+      [eventId]
+    );
+
+    await client.query("COMMIT");
+    await logEventChange(req, 'submitted_for_approval', eventId);
+
+    return ok(res, req, {
+      id: parseInt(eventId, 10),
+      status: 'pending_approval',
+      message: "Event submitted for admin approval"
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Phase E4: Publish event
  * POST /promoter/events/:eventId/publish
  */
@@ -479,26 +576,7 @@ async function publishEvent(req, res) {
     }
 
     // Phase E4: Publish validation (client-aligned)
-    const missingFields = [];
-    if (!event.title) missingFields.push("title");
-    if (!event.description) missingFields.push("description");
-    if (!event.start_at) missingFields.push("startAt");
-    if (!event.end_at) missingFields.push("endAt");
-    if (!event.city) missingFields.push("city");
-    if (!event.format) missingFields.push("format");
-    if (!event.access_mode) missingFields.push("accessMode");
-
-    // Phase E4: Ticket rule at publish - require at least 1 active ticket_type if ticketed
-    if (event.access_mode === 'ticketed' || event.access_mode === 'mixed') {
-      const ticketCountResult = await client.query(
-        `SELECT COUNT(*) as count FROM ticket_types WHERE event_id = $1 AND status = 'active'`,
-        [eventId]
-      );
-
-      if (parseInt(ticketCountResult.rows[0].count, 10) === 0) {
-        missingFields.push("At least 1 active ticket type");
-      }
-    }
+    const missingFields = await getEventSubmissionMissingFields(client, event, eventId);
 
     if (missingFields.length > 0) {
       await client.query("ROLLBACK");
@@ -815,7 +893,7 @@ async function getEventsList(req, res) {
     const offset = (pageNum - 1) * pageSizeNum;
 
     // Build WHERE conditions
-    const conditions = ["e.status = 'published'", "e.visibility_mode = 'public'"];
+    const conditions = [`e.status = '${BUYER_VISIBLE_EVENT_STATUS}'`, "e.visibility_mode = 'public'"];
     const params = [];
     let paramCount = 1;
 
@@ -977,14 +1055,14 @@ async function getEventDetail(req, res) {
   try {
     const eventId = validateEventId(req.params.id);
 
-    // Only published + public events
+    // Only buyer-visible + public events
     const eventResult = await pool.query(
       `SELECT
         e.*,
         u.name as promoter_name
        FROM events e
        LEFT JOIN users u ON u.id = e.promoter_id
-       WHERE e.id = $1 AND e.status = 'published' AND e.visibility_mode = 'public'`,
+       WHERE e.id = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility_mode = 'public'`,
       [eventId]
     );
 
@@ -1101,14 +1179,14 @@ async function getEventByShareToken(req, res) {
   try {
     const { shareToken } = req.params;
 
-    // Only published + private_link events
+    // Only buyer-visible + private_link events
     const eventResult = await pool.query(
       `SELECT
         e.*,
         u.name as promoter_name
        FROM events e
        LEFT JOIN users u ON u.id = e.promoter_id
-       WHERE e.share_token = $1 AND e.status = 'published' AND e.visibility_mode = 'private_link'`,
+       WHERE e.share_token = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility_mode = 'private_link'`,
       [shareToken]
     );
 
@@ -1474,6 +1552,7 @@ module.exports = {
   uploadEventImage,
   setEventCategory,
   setEventTags,
+  submitEvent,
   publishEvent,
   pauseEvent,
   cancelEvent,

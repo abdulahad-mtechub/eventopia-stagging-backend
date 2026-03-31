@@ -267,7 +267,7 @@ BEGIN
     CREATE TYPE event_visibility_enum AS ENUM ('public','unlisted','private');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'event_status_enum') THEN
-    CREATE TYPE event_status_enum AS ENUM ('draft','published','completed','cancelled','unpublished');
+    CREATE TYPE event_status_enum AS ENUM ('draft','pending_approval','active','published','completed','cancelled','unpublished');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ticket_status_enum') THEN
     CREATE TYPE ticket_status_enum AS ENUM ('active','sold_out','ended','hidden');
