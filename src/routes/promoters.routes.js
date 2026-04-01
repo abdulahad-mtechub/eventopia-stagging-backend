@@ -27,6 +27,7 @@ const {
   uploadEventImage,
   setEventCategory,
   setEventTags,
+  submitEvent,
   publishEvent,
   pauseEvent,
   cancelEvent,
@@ -115,6 +116,8 @@ router.post("/events/:eventId/images", requireActivePromoter, requireEventOwners
 router.put("/events/:eventId/category", requireActivePromoter, requireEventOwnership, setEventCategory);
 // Set event tags
 router.put("/events/:eventId/tags", requireActivePromoter, requireEventOwnership, setEventTags);
+// Submit event for admin approval
+router.post("/events/:eventId/submit", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ submitEvent);
 // Publish event
 router.post("/events/:eventId/publish", requireActivePromoter, requireEventOwnership, /* statusChangeLimiter, */ publishEvent);
 // Pause event

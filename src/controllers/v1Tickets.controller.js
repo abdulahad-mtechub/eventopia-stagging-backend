@@ -6,6 +6,7 @@
 const pool = require("../db");
 const crypto = require("crypto");
 const { ok, fail } = require("../utils/standardResponse");
+const { BUYER_VISIBLE_EVENT_STATUS, isBuyerVisibleEventStatus } = require("../utils/eventStatus");
 const { resolveTier } = require("../services/tierResolver.service");
 const { receiveTicketPayment } = require("../services/escrowReceive.service");
 const { allocateCredit } = require("../services/allocateCredit.service");
@@ -54,9 +55,9 @@ async function purchaseTicketsV1(req, res) {
         return fail(res, req, 404, "EVENT_NOT_FOUND", "Event not found");
       }
       const event = eventResult.rows[0];
-      if (event.status !== "published") {
+      if (!isBuyerVisibleEventStatus(event.status)) {
         await client.query("ROLLBACK");
-        return fail(res, req, 400, "EVENT_NOT_LIVE", "Event is not live (must be published)");
+        return fail(res, req, 400, "EVENT_NOT_LIVE", `Event is not live (must be ${BUYER_VISIBLE_EVENT_STATUS})`);
       }
 
       const tierResult = await client.query(
