@@ -1107,7 +1107,8 @@ async function cancelEvent(req, res) {
       id: parseInt(eventId, 10),
       status: 'cancelled',
       cancelledAt: new Date().toISOString(),
-      cancelReason: reason
+      cancelReason: reason,
+      message: "Event cancelled successfully"
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1254,6 +1255,140 @@ async function getPromoter(req, res) {
   } catch (err) {
     console.error('Get Promoter details error:', err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to get Promoter details");
+  }
+}
+
+/**
+ * Approve event for buyer visibility
+ * POST /admin/kings-account/events/:eventId/approve
+ */
+async function approvePendingEvent(req, res) {
+  const client = await pool.connect();
+  try {
+    const { eventId } = req.params;
+
+    await client.query("BEGIN");
+
+    const eventResult = await client.query(
+      `SELECT id, status FROM events WHERE id = $1`,
+      [eventId]
+    );
+
+    if (eventResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, req, 404, "NOT_FOUND", "Event not found");
+    }
+
+    const event = eventResult.rows[0];
+
+    if (event.status === "active") {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Event is already active");
+    }
+
+    if (event.status !== "pending_approval") {
+      await client.query("ROLLBACK");
+      return fail(res, req, 400, "INVALID_STATE", "Only pending approval events can be activated");
+    }
+
+    await client.query(
+      `UPDATE events
+       SET status = 'active',
+           published_at = COALESCE(published_at, NOW()),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [eventId]
+    );
+
+    await client.query("COMMIT");
+    await logEventChange(req, "kings_account_approved", parseInt(eventId, 10));
+
+    return ok(res, req, {
+      id: parseInt(eventId, 10),
+      status: "active",
+      publishedAt: new Date().toISOString(),
+      message: "Event approved successfully"
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    return fail(res, req, 500, "INTERNAL_ERROR", err.message);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * List events pending King's Account approval
+ * GET /admin/kings-account/events/pending-approval
+ */
+async function listPendingApprovalEvents(req, res) {
+  try {
+    const { page = "1", pageSize = "50", city, startDate, endDate } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const pageSizeNum = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 50));
+    const offset = (pageNum - 1) * pageSizeNum;
+    const conditions = ["e.status = $1"];
+    const params = ["pending_approval"];
+    let paramCount = 2;
+
+    if (city) {
+      conditions.push(`e.city = $${paramCount++}`);
+      params.push(city);
+    }
+
+    if (startDate) {
+      conditions.push(`e.start_at >= $${paramCount++}`);
+      params.push(startDate);
+    }
+
+    if (endDate) {
+      conditions.push(`e.end_at <= $${paramCount++}`);
+      params.push(endDate);
+    }
+
+    const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total FROM events e ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    const result = await pool.query(
+      `SELECT
+         e.id,
+         e.title,
+         e.description,
+         e.status,
+         e.visibility_mode,
+         e.format,
+         e.access_mode,
+         e.city,
+         e.venue_name,
+         e.start_at,
+         e.end_at,
+         e.cover_image_url,
+         e.created_at,
+         e.updated_at,
+         u.id as promoter_id,
+         u.name as promoter_name,
+         u.email as promoter_email
+       FROM events e
+       JOIN users u ON u.id = e.promoter_id
+       ${whereClause}
+       ORDER BY e.updated_at DESC, e.created_at DESC
+       LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
+      [...params, pageSizeNum, offset]
+    );
+
+    return ok(res, req, {
+      events: result.rows,
+      pagination: { page: pageNum, pageSize: pageSizeNum, total }
+    });
+  } catch (err) {
+    console.error("List pending approval Events error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to list pending approval Events");
   }
 }
 
@@ -2432,6 +2567,8 @@ module.exports = {
   cancelEvent,
   listPromoters,
   getPromoter,
+  approvePendingEvent,
+  listPendingApprovalEvents,
   listEvents,
   getEvent,
   listCharityApplications,

@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { requireAuth, requireFounderOrAdmin } = require("../middlewares/auth.middleware");
+const { requireAuth, requireFounderOrAdmin, requireRole } = require("../middlewares/auth.middleware");
 const {
   approveGuruApplication,
   approveNetworkManagerApplication,
@@ -19,6 +19,8 @@ const {
   cancelEvent,
   listPromoters,
   getPromoter,
+  approvePendingEvent,
+  listPendingApprovalEvents,
   listEvents,
   getEvent,
   listCharityApplications,
@@ -58,6 +60,12 @@ const {
 
 // All admin routes require authentication and founder or admin role
 router.use(requireAuth);
+
+// King's Account pending approval event review
+router.get("/kings-account/events/pending-approval", requireRole("kings_account", "founder", "admin"), listPendingApprovalEvents);
+router.post("/kings-account/events/:eventId/approve", requireRole("kings_account", "founder", "admin"), approvePendingEvent);
+router.post("/kings-account/events/:eventId/cancel", requireRole("kings_account", "founder", "admin"), cancelEvent);
+
 router.use(requireFounderOrAdmin);
 
 // Network Manager approval / reject
