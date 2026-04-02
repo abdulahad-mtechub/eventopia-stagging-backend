@@ -2,6 +2,7 @@ const pool = require("../db");
 const { ok, fail } = require("../utils/standardResponse");
 const { logEventChange } = require("../middlewares/audit.middleware");
 const { BUYER_VISIBLE_EVENT_STATUS } = require("../utils/eventStatus");
+const { ensureEscrowLiabilityForEvent, markPayoutEligibleForEvent } = require("../services/escrowLiability.service");
 const crypto = require("crypto");
 
 /**
@@ -589,6 +590,12 @@ async function publishEvent(req, res) {
       [eventId]
     );
 
+    try {
+      await ensureEscrowLiabilityForEvent(eventId, { client });
+    } catch (liabilityErr) {
+      console.warn("[publishEvent] liability sync skipped:", liabilityErr.message);
+    }
+
     await client.query("COMMIT");
     await logEventChange(req, 'published', eventId);
 
@@ -706,6 +713,12 @@ async function republishEvent(req, res) {
       `UPDATE events SET status = 'published', published_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [eventId]
     );
+
+    try {
+      await ensureEscrowLiabilityForEvent(eventId, { client });
+    } catch (liabilityErr) {
+      console.warn("[republishEvent] liability sync skipped:", liabilityErr.message);
+    }
 
     await client.query("COMMIT");
     await logEventChange(req, 'republished', eventId);
@@ -1354,6 +1367,12 @@ async function completeEvent(req, res) {
       `UPDATE events SET completion_status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [eventId]
     );
+
+    try {
+      await markPayoutEligibleForEvent(eventId, { client });
+    } catch (liabilityErr) {
+      console.warn("[completeEvent] payout-eligible sync skipped:", liabilityErr.message);
+    }
 
     await client.query("COMMIT");
     await logEventChange(req, 'completed', eventId);

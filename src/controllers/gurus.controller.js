@@ -3,6 +3,7 @@ const { ok, fail } = require("../utils/standardResponse");
 const GuruService = require("../services/guru.service");
 const ReferralService = require("../services/referral.service");
 const CommissionService = require("../services/commission.service");
+const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
 
 /**
  * Create Guru Application
@@ -665,6 +666,8 @@ async function approvePromoterApplication(req, res) {
        RETURNING roles_version`,
       [application.user_id]
     );
+
+    await ensurePromoterCreditWallet(client, application.user_id);
 
     await client.query("COMMIT");
 
