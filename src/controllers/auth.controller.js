@@ -14,6 +14,10 @@ const {
   sendPromoterReferralInviteEmail,
   sendPromoterReferralInviteResendEmail,
 } = require("../services/inviteEmailService");
+const {
+  ensurePromoterCreditWallet,
+  ensurePromoterCreditWalletIfActivePromoter,
+} = require("../services/promoterCreditWallet.service");
 function isValidEmail(email) {
   return /^(?!\.)(?!.*\.\.)([A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(email);
 }
@@ -238,6 +242,21 @@ if (errors.length > 0) {
       [user.id]
     );
     const updatedUser = updatedUserResult.rows[0];
+
+    const acct = updatedUser.account_status || "active";
+    if (updatedUser.role === "promoter" && acct === "active") {
+      const w = await pool.query(
+        `SELECT 1 FROM promoter_credit_wallets WHERE promoter_id = $1 LIMIT 1`,
+        [updatedUser.id]
+      );
+      if (w.rowCount === 0) {
+        try {
+          await ensurePromoterCreditWalletIfActivePromoter(updatedUser.id);
+        } catch (e) {
+          console.error("[verifyOtpEmail] ensurePromoterCreditWalletIfActivePromoter:", e.message);
+        }
+      }
+    }
 
     // Users with NULL role (Network Manager applicants) can login if email is verified
     // They need to setup their account and submit their application
@@ -843,6 +862,22 @@ async function register(req, res) {
 
     const user = userResult.rows[0];
 
+    if (user.role === "promoter") {
+      const wClient = await pool.connect();
+      try {
+        await wClient.query("BEGIN");
+        await ensurePromoterCreditWallet(wClient, user.id);
+        await wClient.query("COMMIT");
+      } catch (wErr) {
+        try {
+          await wClient.query("ROLLBACK");
+        } catch (_) {}
+        console.error("[register] ensurePromoterCreditWallet:", wErr.message);
+      } finally {
+        wClient.release();
+      }
+    }
+
     // If user registered via invite, mark invite as used and handle special flows
     if (inviteData) {
       const client = await pool.connect();
@@ -1141,6 +1176,20 @@ async function login(req, res) {
       });
     }
 
+    if (user.role === "promoter" && accountStatus === "active") {
+      const w = await pool.query(
+        `SELECT 1 FROM promoter_credit_wallets WHERE promoter_id = $1 LIMIT 1`,
+        [user.id]
+      );
+      if (w.rowCount === 0) {
+        try {
+          await ensurePromoterCreditWalletIfActivePromoter(user.id);
+        } catch (e) {
+          console.error("[login] ensurePromoterCreditWalletIfActivePromoter:", e.message);
+        }
+      }
+    }
+
     // Update last login timestamp
     await pool.query(
       `
@@ -1426,6 +1475,10 @@ async function oauthRegister(req, res) {
            ON CONFLICT (promoter_user_id) DO NOTHING`,
           [user.id, guru_user_id]
         );
+      }
+
+      if (user.role === "promoter") {
+        await ensurePromoterCreditWallet(client, user.id);
       }
 
       await client.query("COMMIT");
@@ -2856,6 +2909,8 @@ async function promoterRegisterViaReferral(req, res) {
         [user.id, guruId]
       );
     }
+
+    await ensurePromoterCreditWallet(client, user.id);
 
     // MARK INVITE USED
     if (isTimeBasedInvite) {

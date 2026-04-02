@@ -7,6 +7,7 @@
 
 const pool = require("../db");
 const { createLedgerEntry } = require("./ledgerCore.service");
+const { addGrossRevenueToLiability } = require("./escrowLiability.service");
 
 /**
  * Process incoming ticket payment: update escrow balance and write ledger entries.
@@ -48,6 +49,16 @@ async function receiveTicketPayment({
         `UPDATE escrow_accounts SET balance = balance + $1, updated_at = NOW() WHERE territory_id = $2`,
         [escrow_amount_pence, territory_id]
       );
+
+      // Keep promoter escrow view in sync with confirmed ticket revenue.
+      // Best-effort: do not interrupt payment routing if liability context is not available yet.
+      if (event_id) {
+        try {
+          await addGrossRevenueToLiability(event_id, escrow_amount_pence, { client });
+        } catch (liabilityErr) {
+          console.warn("[escrowReceive] liability sync skipped:", liabilityErr.message);
+        }
+      }
     }
 
     let escrow_ledger_id = null;

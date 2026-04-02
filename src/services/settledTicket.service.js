@@ -28,6 +28,24 @@ const SETTLED_TICKET_CONDITIONS = `
  * @param {Date|string|null} dateTo - optional
  * @returns {Promise<number>}
  */
+/**
+ * Count settled, non-refunded tickets for all events owned by a promoter (users.id).
+ * Used for credit wallet unlock threshold (575 settled tickets).
+ * @param {number} promoterUserId - events.promoter_id
+ * @returns {Promise<number>}
+ */
+async function countSettledTicketsForPromoter(promoterUserId) {
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS cnt
+     FROM tickets t
+     JOIN events e ON e.id = t.event_id
+     WHERE e.promoter_id = $1
+       AND ${SETTLED_TICKET_CONDITIONS.replace(/\n/g, " ")}`,
+    [promoterUserId]
+  );
+  return parseInt(result.rows[0]?.cnt, 10) || 0;
+}
+
 async function countSettledTicketsForGuru(guruId, dateFrom, dateTo) {
   const params = [guruId];
   let dateFilter = "";
@@ -170,6 +188,7 @@ async function getRefundCountsByPeriod(guruId) {
 module.exports = {
   REFUNDED_STATUSES,
   SETTLED_TICKET_CONDITIONS,
+  countSettledTicketsForPromoter,
   countSettledTicketsForGuru,
   countRefundedTicketsForGuru,
   countSettledTicketsForPromoterInGuruNetwork,

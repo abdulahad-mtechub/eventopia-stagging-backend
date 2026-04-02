@@ -14,6 +14,8 @@ const PlatformLedgerService = require("../services/platformLedger.service");
 const TerritoryApplicationService = require("../services/territoryApplication.service");
 const TerritoryLicenceService = require("../services/territoryLicence.service");
 const TerritoryLicenceInventoryService = require("../services/territoryLicenceInventory.service");
+const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
+const { ensureEscrowLiabilityForEvent } = require("../services/escrowLiability.service");
 
 /**
  * Approve Guru application
@@ -480,6 +482,8 @@ async function approvePromoterApplication(req, res) {
         [application.user_id]
       );
     }
+
+    await ensurePromoterCreditWallet(client, application.user_id);
 
     // Update invoice status if exists
     await client.query(
@@ -1299,6 +1303,12 @@ async function approvePendingEvent(req, res) {
        WHERE id = $1`,
       [eventId]
     );
+
+    try {
+      await ensureEscrowLiabilityForEvent(parseInt(eventId, 10), { client });
+    } catch (liabilityErr) {
+      console.warn("[approvePendingEvent] liability sync skipped:", liabilityErr.message);
+    }
 
     await client.query("COMMIT");
     await logEventChange(req, "kings_account_approved", parseInt(eventId, 10));

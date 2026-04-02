@@ -69,7 +69,7 @@ class EscrowService {
         alert = {
           level: 'RED',
           message: 'Escrow coverage below 1.0. No payouts can be approved without CEO override.',
-          notified_roles: ['finance', 'ceo'],
+          notified_roles: ['finance', 'kings_account', 'ceo'],
           triggered_at: new Date().toISOString()
         };
       }
@@ -299,6 +299,7 @@ class EscrowService {
       WHERE territory_id = $1
       AND alert_type = 'ESCROW_COVERAGE_RED'
       AND resolved_at IS NULL
+      AND created_at >= (NOW() - INTERVAL '15 minutes')
       ORDER BY created_at DESC
       LIMIT 1
     `;
@@ -333,7 +334,7 @@ class EscrowService {
         'CRITICAL',
         'Escrow Coverage Below Minimum',
         `Escrow coverage ratio has fallen below 1.0 (${coverage.coverage_ratio || 0}). No payouts can be approved without CEO override. Escrow: £${coverage.escrow_balance}, Liabilities: £${coverage.total_pending_liabilities}`,
-        JSON.stringify(['finance', 'ceo']),
+        JSON.stringify(['finance', 'kings_account', 'ceo']),
         now,
         'pending',
         now,
@@ -422,7 +423,7 @@ class EscrowService {
       );
       */
 
-      console.log(`[EscrowService] Notification queued for alert ${alertId} (roles: finance, ceo)`);
+      console.log(`[EscrowService] Notification queued for alert ${alertId} (roles: finance, kings_account, ceo)`);
 
     } catch (error) {
       console.error('[EscrowService] _notifyRedAlert error:', error.message);

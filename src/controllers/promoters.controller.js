@@ -1,5 +1,6 @@
 const pool = require("../db");
 const bcrypt = require("bcryptjs");
+const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
 
 /**
  * Setup Promoter Account (complete profile)
@@ -273,6 +274,10 @@ async function createApplication(req, res) {
        ON CONFLICT (user_id) DO NOTHING`,
       [userId]
     );
+
+    if (userCheck.rows[0]?.role === "promoter") {
+      await ensurePromoterCreditWallet(client, userId);
+    }
 
     // Create activation fee invoice
     const invoiceResult = await client.query(
