@@ -1,7 +1,3 @@
-/**
- * Contract 24 — GET /api/v1/wallet/me
- * Wallet summary for promoter, guru, or network_manager using existing credit_wallets / credit_ledger.
- */
 
 const pool = require("../db");
 const { UNLOCK_THRESHOLD } = require("./promoterCreditWallet.service");

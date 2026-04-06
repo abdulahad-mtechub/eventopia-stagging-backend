@@ -11,12 +11,17 @@ const {
   setupAccount,
   listPromoterApplications,
   approvePromoterApplication,
+  activatePendingPromoter,
   rejectPromoterApplication,
   getDashboardSummary,
   getReferralInfo,
   getReferralStats,
   getAttachedPromoters,
   getPromoterPerformance,
+  getPromoterDetails,
+  getPromoterCharts,
+  getPromoterStats,
+  getPromoterHistory,
   exportPromotersCsv,
   exportPerformanceCsv,
   getMyRewards,
@@ -56,12 +61,37 @@ router.get("/me", getMyProfile);
 // Promoter management routes (Guru only)
 router.get("/promoters/applications", requireRole('guru'), listPromoterApplications);
 router.post("/promoters/:applicationId/approve", requireRole('guru'), approvePromoterApplication);
+router.post("/dashboard/promoters/:promoterId/activate", requireRole('guru'), activatePendingPromoter);
 router.post("/promoters/:applicationId/reject", requireRole('guru'), rejectPromoterApplication);
 
 // Dashboard routes (require active Guru)
 router.get("/dashboard/summary", requireGuru, getDashboardSummary);
 router.get("/dashboard/referral", requireGuru, getReferralInfo);
 router.get("/dashboard/promoters", requireGuru, getAttachedPromoters);
+router.get(
+  "/dashboard/promoters/:promoterId/details",
+  requireGuru,
+  requirePromoterOwnership,
+  getPromoterDetails
+);
+router.get(
+  "/dashboard/promoters/:promoterId/charts",
+  requireGuru,
+  requirePromoterOwnership,
+  getPromoterCharts
+);
+router.get(
+  "/dashboard/promoters/:promoterId/stats",
+  requireGuru,
+  requirePromoterOwnership,
+  getPromoterStats
+);
+router.get(
+  "/dashboard/promoters/:promoterId/history",
+  requireGuru,
+  requirePromoterOwnership,
+  getPromoterHistory
+);
 router.get("/dashboard/promoters/:promoterId", requireGuru, requirePromoterOwnership, getPromoterPerformance);
 
 // Referral stats

@@ -1,6 +1,81 @@
 const pool = require("../db");
 const { ok, fail } = require("../utils/standardResponse");
 const GuruService = require("../services/guru.service");
+
+function penceToGbpSafe(pence) {
+  return Number(((Number(pence) || 0) / 100).toFixed(2));
+}
+
+function quarterWindowUtcBounds() {
+  const now = new Date();
+  const q = Math.floor(now.getUTCMonth() / 3);
+  const startsAt = new Date(Date.UTC(now.getUTCFullYear(), q * 3, 1, 0, 0, 0, 0));
+  return { startsAt: startsAt.toISOString(), endsAt: now.toISOString() };
+}
+
+/**
+ * Maps DB row from GuruService.getAttachedPromoters to guru dashboard / Figma-friendly payload.
+ */
+function mapAttachedPromoterRow(p) {
+  const ticketsSold = Number(p.tickets_sold || 0);
+  const settledQuarter = Number(p.sprint_settled_tickets_quarter || 0);
+  const refundsQuarter = Number(p.refunds_count_quarter || 0);
+  const denom = settledQuarter + refundsQuarter;
+  const refundRatePercentQuarter = denom > 0 ? Number(((100 * refundsQuarter) / denom).toFixed(2)) : 0;
+
+  const linkSrc = String(p.link_source || "").toLowerCase();
+  const fromReferralLink = linkSrc === "referral_link" || linkSrc.includes("referral");
+  const signedUpViaReferral = Boolean(p.signed_up_via_referral);
+  const isReferralModeActive = fromReferralLink || signedUpViaReferral;
+
+  const ledgerConfirmedGbp = penceToGbpSafe(p.guru_credit_confirmed_pence);
+  const ledgerProjectedGbp = penceToGbpSafe(p.guru_credit_projected_pence);
+  const commissionsGbp = penceToGbpSafe(p.commission_total_pence);
+
+  const figmaCreditNowGbp = ledgerConfirmedGbp;
+  const normalCandidate =
+    commissionsGbp > 0 ? commissionsGbp : Number((ledgerConfirmedGbp + ledgerProjectedGbp).toFixed(2));
+  const figmaCreditNormalGbp = Number(Math.max(normalCandidate, figmaCreditNowGbp).toFixed(2));
+
+  return {
+    promoterId: p.id,
+    userNo: p.user_no ?? null,
+    name: p.name,
+    email: p.email,
+    avatarUrl: p.avatar_url ?? null,
+    accountStatus: p.account_status ?? null,
+    link: {
+      source: p.link_source,
+      attachedAt: p.attached_at,
+    },
+    referral: {
+      currentMode: isReferralModeActive ? "referral" : "normal",
+      isReferralModeActive,
+      signedUpViaReferral,
+      fromReferralLink,
+      referralWindowExpiresAt: null,
+    },
+    credits: {
+      currency: "GBP",
+      guruCreditLedgerConfirmedGbp: ledgerConfirmedGbp,
+      guruCreditLedgerProjectedGbp: ledgerProjectedGbp,
+      guruCommissionsRecordedTotalGbp: commissionsGbp
+      
+    },
+    stats: {
+      ticketsSold,
+      grossSalesPence: Number(p.gross_sales_pence || 0),
+      grossSalesGbp: penceToGbpSafe(p.gross_sales_pence),
+      sprintContributionSettledTicketsThisUtcQuarter: settledQuarter,
+      refundsCountThisUtcQuarter: refundsQuarter,
+      refundRatePercentThisUtcQuarter: refundRatePercentQuarter,
+      eventsCount: Number(p.events_count || 0),
+    },
+    ticketsSold,
+    grossSales: Number(p.gross_sales_pence || 0),
+    joinedAt: p.attached_at,
+  };
+}
 const ReferralService = require("../services/referral.service");
 const CommissionService = require("../services/commission.service");
 const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
@@ -700,6 +775,149 @@ async function approvePromoterApplication(req, res) {
 }
 
 /**
+ * Activate promoter directly from dashboard list by promoterId.
+ * POST /gurus/dashboard/promoters/:promoterId/activate
+ */
+async function activatePendingPromoter(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const guruId = req.user.id;
+    const promoterId = parseInt(req.params.promoterId, 10);
+    if (!Number.isFinite(promoterId) || promoterId <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: true,
+        message: "Invalid promoter ID.",
+        data: null,
+      });
+    }
+
+    const userResult = await client.query(
+      `SELECT id, user_no, email, name, role, account_status
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [promoterId]
+    );
+    if (userResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: true,
+        message: "Promoter user not found.",
+        data: null,
+      });
+    }
+    const promoter = userResult.rows[0];
+
+    const linkResult = await client.query(
+      `SELECT guru_user_id FROM promoter_guru_links WHERE promoter_user_id = $1 LIMIT 1`,
+      [promoterId]
+    );
+    if (linkResult.rowCount === 0 || Number(linkResult.rows[0].guru_user_id) !== Number(guruId)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        error: true,
+        message: "You are not authorized to activate this promoter.",
+        data: null,
+      });
+    }
+
+    const appResult = await client.query(
+      `SELECT id, account_status
+       FROM promoter_applications
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [promoterId]
+    );
+
+    if (appResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: true,
+        message: "No promoter application found for this user.",
+        data: null,
+      });
+    }
+
+    const application = appResult.rows[0];
+    if (application.account_status === "rejected") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: true,
+        message: "Rejected application cannot be activated.",
+        data: null,
+      });
+    }
+
+    if (String(promoter.account_status || "").toLowerCase() === "active") {
+      await ensurePromoterCreditWallet(client, promoterId);
+      await client.query("COMMIT");
+      return res.json({
+        error: false,
+        message: "Promoter is already active.",
+        data: {
+          application: { id: application.id, accountStatus: "approved" },
+          user: {
+            userId: promoter.user_no ?? promoter.id,
+            email: promoter.email,
+            name: promoter.name,
+            role: "promoter",
+            accountStatus: "active",
+          },
+        },
+      });
+    }
+
+    await client.query(
+      `UPDATE promoter_applications
+       SET account_status = 'approved', reviewed_by = $1, reviewed_at = NOW()
+       WHERE id = $2`,
+      [guruId, application.id]
+    );
+
+    const promoted = await client.query(
+      `UPDATE users
+       SET role = 'promoter', account_status = 'active', roles_version = roles_version + 1
+       WHERE id = $1
+       RETURNING user_no, email, name, roles_version`,
+      [promoterId]
+    );
+
+    await ensurePromoterCreditWallet(client, promoterId);
+
+    await client.query("COMMIT");
+    return res.json({
+      error: false,
+      message: "Promoter activated successfully.",
+      data: {
+        application: { id: application.id, accountStatus: "approved" },
+        user: {
+          userId: promoted.rows[0].user_no ?? promoterId,
+          email: promoted.rows[0].email,
+          name: promoted.rows[0].name,
+          role: "promoter",
+          accountStatus: "active",
+          rolesVersion: promoted.rows[0].roles_version,
+        },
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Activate promoter error:", err);
+    return res.status(500).json({
+      error: true,
+      message: "Unable to activate promoter at the moment. Please try again later.",
+      data: null,
+    });
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Reject Promoter Application
  * POST /gurus/promoters/:applicationId/reject
  */
@@ -877,14 +1095,10 @@ async function getAttachedPromoters(req, res) {
 
     const promoters = await GuruService.getAttachedPromoters(guruId, dateFrom, dateTo);
 
-    return ok(res, req, promoters.map(p => ({
-      promoterId: p.id,
-      name: p.name,
-      email: p.email,
-      ticketsSold: parseInt(p.tickets_sold || 0),
-      grossSales: parseInt(p.gross_sales || 0),
-      joinedAt: p.attached_at
-    })));
+    return ok(res, req, {
+      quarterWindowUtc: quarterWindowUtcBounds(),
+      promoters: promoters.map(mapAttachedPromoterRow),
+    });
   } catch (err) {
     console.error('Get attached promoters error:', err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to get attached promoters");
@@ -925,6 +1139,159 @@ async function getPromoterPerformance(req, res) {
 }
 
 /**
+ * Promoter detail header + summary cards (Figma promoter details screen).
+ * GET /api/gurus/dashboard/promoters/:promoterId/details
+ */
+async function getPromoterDetails(req, res) {
+  try {
+    const guruId = req.user.id;
+    const promoterId = parseInt(req.params.promoterId, 10);
+    const data = await GuruService.getPromoterDetailsForGuru(guruId, promoterId);
+    const p = data.profile;
+
+    return ok(res, req, {
+      profile: {
+        promoterId: p.id,
+        userNo: p.user_no ?? null,
+        name: p.name,
+        email: p.email,
+        avatarUrl: p.avatar_url ?? null,
+        accountStatus: p.account_status ?? null,
+        roleLabel: p.role === "promoter" ? "Event Promoter" : p.role || "Promoter",
+        districtOrCity: p.city ?? null,
+        guruTerritoryName: p.guru_territory_name ?? null,
+        subtitleLine: [p.role === "promoter" ? "Event Promoter" : p.role, p.city || p.guru_territory_name]
+          .filter(Boolean)
+          .join(" • "),
+      },
+      link: data.link,
+      summaryCards: data.summary,
+      meta: data.meta,
+    });
+  } catch (err) {
+    if (err.message === "Promoter is not attached to this Guru") {
+      return fail(res, req, 403, "NOT_AUTHORIZED", err.message);
+    }
+    console.error("Get promoter details error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to load promoter details");
+  }
+}
+
+/**
+ * Charts tab — time series. Query: granularity=daily|weekly|monthly
+ * GET /api/gurus/dashboard/promoters/:promoterId/charts
+ */
+async function getPromoterCharts(req, res) {
+  try {
+    const guruId = req.user.id;
+    const promoterId = parseInt(req.params.promoterId, 10);
+    const { granularity, date, weekStart, weekEnd, month, year } = req.query;
+    const data = await GuruService.getPromoterChartsForGuru(guruId, promoterId, granularity, {
+      date,
+      weekStart,
+      weekEnd,
+      month,
+      year,
+    });
+    return ok(res, req, data);
+  } catch (err) {
+    if (err.code === "INVALID_GRANULARITY") {
+      return fail(res, req, 400, "INVALID_GRANULARITY", "granularity must be daily, weekly, or monthly");
+    }
+    if (err.code === "INVALID_DATE_PARAMS") {
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_DATE_PARAMS",
+        "For daily pass date=YYYY-MM-DD; for weekly pass weekStart=YYYY-MM-DD (optional weekEnd); for monthly pass month=1-12 and year=YYYY"
+      );
+    }
+    if (err.message === "Promoter is not attached to this Guru") {
+      return fail(res, req, 403, "NOT_AUTHORIZED", err.message);
+    }
+    console.error("Get promoter charts error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to load promoter charts");
+  }
+}
+
+/**
+ * Stats tab. Query: period=daily|weekly|monthly (selects aggregation window).
+ * GET /api/gurus/dashboard/promoters/:promoterId/stats
+ */
+async function getPromoterStats(req, res) {
+  try {
+    const guruId = req.user.id;
+    const promoterId = parseInt(req.params.promoterId, 10);
+    const { period, date, weekStart, weekEnd, month, year } = req.query;
+    const data = await GuruService.getPromoterStatsForGuru(guruId, promoterId, period, {
+      date,
+      weekStart,
+      weekEnd,
+      month,
+      year,
+    });
+    return ok(res, req, data);
+  } catch (err) {
+    if (err.code === "INVALID_PERIOD") {
+      return fail(res, req, 400, "INVALID_PERIOD", "period must be daily, weekly, or monthly");
+    }
+    if (err.code === "INVALID_DATE_PARAMS") {
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_DATE_PARAMS",
+        "For daily pass date=YYYY-MM-DD; for weekly pass weekStart=YYYY-MM-DD (optional weekEnd); for monthly pass month=1-12 and year=YYYY"
+      );
+    }
+    if (err.message === "Promoter is not attached to this Guru") {
+      return fail(res, req, 403, "NOT_AUTHORIZED", err.message);
+    }
+    console.error("Get promoter stats error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to load promoter stats");
+  }
+}
+
+/**
+ * History tab. Query: granularity=daily|weekly|monthly&limit=14
+ * GET /api/gurus/dashboard/promoters/:promoterId/history
+ */
+async function getPromoterHistory(req, res) {
+  try {
+    const guruId = req.user.id;
+    const promoterId = parseInt(req.params.promoterId, 10);
+    const { granularity, limit, date, weekStart, weekEnd, month, year } = req.query;
+    const data = await GuruService.getPromoterHistoryForGuru(guruId, promoterId, granularity, limit, {
+      date,
+      weekStart,
+      weekEnd,
+      month,
+      year,
+    });
+    return ok(res, req, data);
+  } catch (err) {
+    if (err.code === "INVALID_GRANULARITY") {
+      return fail(res, req, 400, "INVALID_GRANULARITY", "granularity must be daily, weekly, or monthly");
+    }
+    if (err.code === "INVALID_DATE_PARAMS") {
+      return fail(
+        res,
+        req,
+        400,
+        "INVALID_DATE_PARAMS",
+        "For daily pass date=YYYY-MM-DD; for weekly pass weekStart=YYYY-MM-DD (optional weekEnd); for monthly pass month=1-12 and year=YYYY"
+      );
+    }
+    if (err.message === "Promoter is not attached to this Guru") {
+      return fail(res, req, 403, "NOT_AUTHORIZED", err.message);
+    }
+    console.error("Get promoter history error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to load promoter history");
+  }
+}
+
+/**
  * Export Promoters CSV
  * GET /guru/exports/promoters.csv
  */
@@ -937,14 +1304,35 @@ async function exportPromotersCsv(req, res) {
 
     // Generate CSV
     const csv = [
-      ['Promoter Name', 'Email', 'Tickets Sold', 'Gross Sales (GBP)', 'Joined At'].join(','),
-      ...promoters.map(p => [
-        p.name,
-        p.email,
-        p.tickets_sold || 0,
-        ((p.gross_sales || 0) / 100).toFixed(2),
-        new Date(p.attached_at).toISOString()
-      ].join(','))
+      [
+        'Promoter Name',
+        'Email',
+        'Tickets Sold',
+        'Gross Sales (GBP)',
+        'Sprint Settled Tickets (UTC quarter)',
+        'Refunds (UTC quarter)',
+        'Refund rate % (quarter)',
+        'Guru credit confirmed (GBP)',
+        'Guru credit projected (GBP)',
+        'Commissions recorded (GBP)',
+        'Joined At',
+      ].join(','),
+      ...promoters.map((p) => {
+        const row = mapAttachedPromoterRow(p);
+        return [
+          row.name,
+          row.email,
+          row.stats.ticketsSold,
+          row.stats.grossSalesGbp.toFixed(2),
+          row.stats.sprintContributionSettledTicketsThisUtcQuarter,
+          row.stats.refundsCountThisUtcQuarter,
+          row.stats.refundRatePercentThisUtcQuarter,
+          row.credits.guruCreditLedgerConfirmedGbp.toFixed(2),
+          row.credits.guruCreditLedgerProjectedGbp.toFixed(2),
+          row.credits.guruCommissionsRecordedTotalGbp.toFixed(2),
+          new Date(row.joinedAt).toISOString(),
+        ].join(',');
+      }),
     ].join('\n');
 
     res.setHeader('Content-Type', 'text/csv');
@@ -971,14 +1359,35 @@ async function exportPerformanceCsv(req, res) {
 
     // Generate CSV
     const csv = [
-      ['Promoter Name', 'Email', 'Tickets Sold', 'Gross Sales (GBP)', 'Joined At'].join(','),
-      ...promoters.map(p => [
-        p.name,
-        p.email,
-        p.tickets_sold || 0,
-        ((p.gross_sales || 0) / 100).toFixed(2),
-        new Date(p.attached_at).toISOString()
-      ].join(','))
+      [
+        'Promoter Name',
+        'Email',
+        'Tickets Sold',
+        'Gross Sales (GBP)',
+        'Sprint Settled Tickets (UTC quarter)',
+        'Refunds (UTC quarter)',
+        'Refund rate % (quarter)',
+        'Guru credit confirmed (GBP)',
+        'Guru credit projected (GBP)',
+        'Commissions recorded (GBP)',
+        'Joined At',
+      ].join(','),
+      ...promoters.map((p) => {
+        const row = mapAttachedPromoterRow(p);
+        return [
+          row.name,
+          row.email,
+          row.stats.ticketsSold,
+          row.stats.grossSalesGbp.toFixed(2),
+          row.stats.sprintContributionSettledTicketsThisUtcQuarter,
+          row.stats.refundsCountThisUtcQuarter,
+          row.stats.refundRatePercentThisUtcQuarter,
+          row.credits.guruCreditLedgerConfirmedGbp.toFixed(2),
+          row.credits.guruCreditLedgerProjectedGbp.toFixed(2),
+          row.credits.guruCommissionsRecordedTotalGbp.toFixed(2),
+          new Date(row.joinedAt).toISOString(),
+        ].join(',');
+      }),
     ].join('\n');
 
     res.setHeader('Content-Type', 'text/csv');
@@ -1092,12 +1501,17 @@ module.exports = {
   setupAccount,
   listPromoterApplications,
   approvePromoterApplication,
+  activatePendingPromoter,
   rejectPromoterApplication,
   getDashboardSummary,
   getReferralInfo,
   getReferralStats,
   getAttachedPromoters,
   getPromoterPerformance,
+  getPromoterDetails,
+  getPromoterCharts,
+  getPromoterStats,
+  getPromoterHistory,
   exportPromotersCsv,
   exportPerformanceCsv,
   getMyRewards,
