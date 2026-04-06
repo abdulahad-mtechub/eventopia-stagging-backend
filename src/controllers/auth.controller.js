@@ -18,6 +18,7 @@ const {
   ensurePromoterCreditWallet,
   ensurePromoterCreditWalletIfActivePromoter,
 } = require("../services/promoterCreditWallet.service");
+const { getWalletMeForUser } = require("../services/walletMe.service");
 function isValidEmail(email) {
   return /^(?!\.)(?!.*\.\.)([A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(email);
 }
@@ -433,6 +434,43 @@ async function getMe(req, res) {
       };
     }
 
+    let promoter = null;
+    if (role === "promoter") {
+      const linkResult = await pool.query(
+        `SELECT pgl.guru_user_id, u.name AS guru_name
+         FROM promoter_guru_links pgl
+         LEFT JOIN users u ON u.id = pgl.guru_user_id
+         WHERE pgl.promoter_user_id = $1
+         LIMIT 1`,
+        [req.user.id]
+      );
+      const assignedGuru =
+        linkResult.rowCount > 0 && linkResult.rows[0].guru_user_id != null
+          ? {
+              id: linkResult.rows[0].guru_user_id,
+              name: linkResult.rows[0].guru_name,
+            }
+          : promoterApplication?.guru?.id != null
+            ? promoterApplication.guru
+            : null;
+
+      let credit = null;
+      const wm = await getWalletMeForUser(req.user.id, ["promoter"]);
+      if (wm.ok) {
+        credit = {
+          balances: wm.body.balances,
+          unlockStatus: wm.body.unlock_status,
+        };
+      }
+
+      promoter = {
+        accountStatus: user.account_status || "active",
+        applicationAccountStatus: promoterApplication?.accountStatus ?? null,
+        assignedGuru,
+        credit,
+      };
+    }
+
     return res.json({
       error: false,
       message: "Your profile information has been retrieved successfully.",
@@ -454,10 +492,11 @@ async function getMe(req, res) {
           territory_id: guruApplication.networkManager?.territoryName,
         } : {}),
         ...(role === 'promoter' && promoterApplication ? {
-          guru_id: promoterApplication.guru?.id,
+          guru_id: promoter?.assignedGuru?.id ?? promoterApplication.guru?.id,
           network_manager_id: promoterApplication.networkManagerId,
           territory_id: promoterApplication.territoryName,
         } : {}),
+        ...(promoter ? { promoter } : {}),
       },
     });
   } catch (err) {

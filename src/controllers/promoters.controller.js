@@ -1,6 +1,7 @@
 const pool = require("../db");
 const bcrypt = require("bcryptjs");
 const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
+const { getWalletMeForUser } = require("../services/walletMe.service");
 
 /**
  * Setup Promoter Account (complete profile)
@@ -426,6 +427,31 @@ async function getMyProfile(req, res) {
 
     const promoter = user;
 
+    let credit = null;
+    if (isApprovedPromoter) {
+      const wr = await getWalletMeForUser(userId, ["promoter"]);
+      if (wr.ok) {
+        const b = wr.body.balances;
+        credit = {
+          projectedGbp: b.projected,
+          confirmedGbp: b.confirmed,
+          availableGbp: b.confirmed,
+          netWithdrawableGbp: b.net_withdrawable,
+          unlockStatus: wr.body.unlock_status,
+        };
+      } else {
+        credit = {
+          projectedGbp: 0,
+          confirmedGbp: 0,
+          availableGbp: 0,
+          netWithdrawableGbp: 0,
+          unlockStatus: null,
+          walletUnavailable: true,
+          reason: wr.code === "NO_WALLET" ? "no_credit_wallet" : "wallet_access_blocked",
+        };
+      }
+    }
+
     return res.json({
       error: false,
       message: "Promoter profile retrieved successfully.",
@@ -448,7 +474,8 @@ async function getMyProfile(req, res) {
           application: hasPendingApplication ? {
             id: promoter.application_id,
             status: promoter.application_status
-          } : null
+          } : null,
+          credit,
         },
       },
     });
