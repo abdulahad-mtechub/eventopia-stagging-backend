@@ -16,6 +16,10 @@ const TerritoryLicenceService = require("../services/territoryLicence.service");
 const TerritoryLicenceInventoryService = require("../services/territoryLicenceInventory.service");
 const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
 const { ensureEscrowLiabilityForEvent } = require("../services/escrowLiability.service");
+const {
+  getReferralPoolAdminView,
+  approveReferralPayout,
+} = require("../services/promoterReferral.service");
 
 /**
  * Approve Guru application
@@ -145,6 +149,19 @@ async function approveGuruApplication(req, res) {
     );
 
     const newRolesVersion = userResult.rows[0].roles_version;
+
+    // Ensure guru profile exists with licence debt baseline for self-registration path.
+    const guruProfileExists = await client.query(
+      `SELECT user_id FROM guru_profiles WHERE user_id = $1 LIMIT 1`,
+      [application.user_id]
+    );
+    if (guruProfileExists.rowCount === 0) {
+      await client.query(
+        `INSERT INTO guru_profiles (user_id, level, licence_balance, created_at)
+         VALUES ($1, 1, -295, NOW())`,
+        [application.user_id]
+      );
+    }
 
     // Set guru level L1 with service_fee_rate 20%
     const levelResult = await client.query(
@@ -2559,6 +2576,56 @@ async function suspendTerritoryLicence(req, res) {
   }
 }
 
+/**
+ * GET /admin/referral-pool
+ */
+async function getReferralPool(req, res) {
+  try {
+    const data = await getReferralPoolAdminView();
+    return res.json({
+      error: false,
+      message: "Referral pool retrieved successfully.",
+      data,
+    });
+  } catch (err) {
+    console.error("Get referral pool error:", err);
+    return res.status(500).json({
+      error: true,
+      message: "Unable to fetch referral pool.",
+      data: null,
+    });
+  }
+}
+
+/**
+ * POST /admin/referrals/:id/approve-payout
+ */
+async function approveReferralPayoutByAdmin(req, res) {
+  try {
+    const referralId = parseInt(req.params.id, 10);
+    if (isNaN(referralId) || referralId <= 0) {
+      return res.status(400).json({
+        error: true,
+        message: "Invalid referral ID.",
+        data: null,
+      });
+    }
+    const data = await approveReferralPayout(referralId, req.user.id);
+    return res.json({
+      error: false,
+      message: "Referral payout approved successfully.",
+      data,
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    return res.status(status).json({
+      error: true,
+      message: err.message || "Unable to approve referral payout.",
+      data: null,
+    });
+  }
+}
+
 module.exports = {
   approveGuruApplication,
   approveNetworkManagerApplication,
@@ -2608,4 +2675,6 @@ module.exports = {
   rejectTerritoryApplication,
   updateTerritory,
   suspendTerritoryLicence,
+  getReferralPool,
+  approveReferralPayoutByAdmin,
 };

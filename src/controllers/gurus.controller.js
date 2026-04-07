@@ -89,7 +89,13 @@ async function createApplication(req, res) {
   try {
     await client.query("BEGIN");
 
-    const { network_manager_user_id, avatar_url, agreed_to_terms, agreed_to_guru_agreement } = req.body;
+    const {
+      network_manager_user_id,
+      avatar_url,
+      contract_name,
+      agreed_to_terms,
+      agreed_to_guru_agreement,
+    } = req.body;
     const userId = req.user.id;
 
     // Validation
@@ -157,11 +163,19 @@ async function createApplication(req, res) {
     const appResult = await client.query(
       `
       INSERT INTO guru_applications
-        (user_id, network_manager_user_id, territory_name, avatar_url, agreed_to_terms, agreed_to_guru_agreement, account_status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+        (user_id, network_manager_user_id, territory_name, avatar_url, contract_name, agreed_to_terms, agreed_to_guru_agreement, account_status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
       RETURNING *
       `,
-      [userId, network_manager_user_id, nmResult.rows[0].city, avatar_url || null, agreed_to_terms, agreed_to_guru_agreement]
+      [
+        userId,
+        network_manager_user_id,
+        nmResult.rows[0].city,
+        avatar_url || null,
+        contract_name || null,
+        agreed_to_terms,
+        agreed_to_guru_agreement,
+      ]
     );
 
     // Set user account_status to PENDING
@@ -188,6 +202,7 @@ async function createApplication(req, res) {
           networkManagerId: network_manager_user_id,
           networkManagerName: nmResult.rows[0].name,
           territoryName: nmResult.rows[0].city,
+          contractName: application.contract_name,
           accountStatus: application.account_status,
           createdAt: application.created_at,
         },
@@ -212,7 +227,7 @@ async function createApplication(req, res) {
  */
 async function updateMyApplication(req, res) {
   try {
-    const { avatar_url, agreed_to_terms, agreed_to_guru_agreement } = req.body;
+    const { avatar_url, contract_name, agreed_to_terms, agreed_to_guru_agreement } = req.body;
     const userId = req.user.id;
 
     // Get the user's application
@@ -252,6 +267,11 @@ async function updateMyApplication(req, res) {
     if (avatar_url !== undefined) {
       updateFields.push(`avatar_url = $${paramCount++}`);
       updateValues.push(avatar_url);
+    }
+
+    if (contract_name !== undefined) {
+      updateFields.push(`contract_name = $${paramCount++}`);
+      updateValues.push(contract_name);
     }
 
     if (agreed_to_terms !== undefined) {
@@ -315,7 +335,7 @@ async function getMyApplication(req, res) {
     const appResult = await pool.query(
       `
       SELECT ga.id, ga.account_status, ga.created_at, ga.reviewed_at, ga.rejection_reason,
-             ga.network_manager_user_id, ga.avatar_url,
+             ga.network_manager_user_id, ga.avatar_url, ga.contract_name,
              ga.activation_fee_status, ga.activation_fee_balance, ga.activation_fee_payment_method,
              ga.verification_status,
              u.name as network_manager_name, u.city as network_manager_territory
@@ -357,6 +377,7 @@ async function getMyApplication(req, res) {
           reviewedAt: application.reviewed_at,
           rejectionReason: application.rejection_reason,
           avatarUrl: application.avatar_url,
+          contractName: application.contract_name,
           activationFeeStatus: application.activation_fee_status,
           activationFeeBalance: application.activation_fee_balance != null ? Number(application.activation_fee_balance) : null,
           activationFeePaymentMethod: application.activation_fee_payment_method,
@@ -512,11 +533,12 @@ async function getMyProfile(req, res) {
     // Check if user is an approved Guru or has a pending Guru application
     const userResult = await pool.query(
       `
-      SELECT u.*, gnm.territory_name,
+      SELECT u.*, gnm.territory_name, gp.licence_balance,
              nm.id as nm_id, nm.name as nm_name, nm.email as nm_email, nm.avatar_url as nm_avatar_url,
              ga.account_status as guru_application_status
       FROM users u
       LEFT JOIN guru_network_manager gnm ON gnm.guru_user_id = u.id
+      LEFT JOIN guru_profiles gp ON gp.user_id = u.id
       LEFT JOIN users nm ON nm.id = gnm.network_manager_user_id
       LEFT JOIN guru_applications ga ON ga.user_id = u.id
       WHERE u.id = $1 AND (
@@ -549,6 +571,7 @@ async function getMyProfile(req, res) {
           avatarUrl: guru.avatar_url,
           role: guru.role,
           accountStatus: guru.account_status,
+          licenceBalance: guru.licence_balance != null ? Number(guru.licence_balance) : null,
           pending: isPending,
           territory: {
             name: guru.territory_name,

@@ -1013,6 +1013,19 @@ async function approveGuruApplication(req, res) {
 
     const newRolesVersion = userResult.rows[0].roles_version;
 
+    // Ensure guru profile exists with licence debt baseline for self-registration path.
+    const guruProfileExists = await client.query(
+      `SELECT user_id FROM guru_profiles WHERE user_id = $1 LIMIT 1`,
+      [application.user_id]
+    );
+    if (guruProfileExists.rowCount === 0) {
+      await client.query(
+        `INSERT INTO guru_profiles (user_id, level, licence_balance, created_at)
+         VALUES ($1, 1, -295, NOW())`,
+        [application.user_id]
+      );
+    }
+
     // Set guru level L1 with service_fee_rate 20%
     const levelResult = await client.query(
       `SELECT rate_per_ticket, service_fee_rate FROM guru_commission_rates WHERE level = 1`

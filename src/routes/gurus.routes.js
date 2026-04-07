@@ -38,7 +38,7 @@ const {
   getLevelInfo,
   getSprintMode
 } = require("../controllers/guruMarketingHub.controller");
-const { getLicenseInfo } = require("../controllers/guruLicense.controller");
+const { getLicenseInfo, getLicenseBalance } = require("../controllers/guruLicense.controller");
 const { validateInvite } = require("../controllers/inviteValidation.controller");
 
 // Public endpoint - no authentication required
@@ -108,6 +108,7 @@ router.get("/rewards", requireGuru, getMyRewards);
 
 // License information
 router.get("/license/info", getLicenseInfo);
+router.get("/license/balance", getLicenseBalance);
 
 // Marketing Hub
 router.get("/marketing-hub", requireRole('guru'), getMarketingHub);

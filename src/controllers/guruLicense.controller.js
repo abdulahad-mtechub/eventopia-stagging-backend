@@ -1,5 +1,6 @@
 const pool = require("../db");
 const { ok, fail } = require("../utils/standardResponse");
+const GURU_LICENCE_TOTAL = 295;
 
 /**
  * Get Guru License Information
@@ -137,13 +138,101 @@ async function getLicenseInfo(req, res) {
       ]
     };
 
-    return ok(res, req, "License information retrieved", licenseInfo);
+    return ok(res, req, licenseInfo);
   } catch (err) {
     console.error('Get license info error:', err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to retrieve license information");
   }
 }
 
+/**
+ * Get Guru licence clearance progress (current -295 implementation).
+ * GET /gurus/license/balance
+ *
+ * Data source:
+ * - Total licence fee: fixed 295
+ * - Cleared amount: guru CREDIT_ALLOCATION earnings from promoter ticket sales
+ * - Remaining balance: total - cleared (never below 0)
+ */
+async function getLicenseBalance(req, res) {
+  try {
+    const guruId = req.user.id;
+
+    let profileResult = await pool.query(
+      `SELECT licence_balance, level FROM guru_profiles WHERE user_id = $1 LIMIT 1`,
+      [guruId]
+    );
+
+    // Backfill for existing gurus created before guru_profiles baseline was enforced.
+    if (profileResult.rowCount === 0) {
+      await pool.query(
+        `INSERT INTO guru_profiles (user_id, level, licence_balance, created_at)
+         VALUES ($1, 1, -295, NOW())
+         ON CONFLICT (user_id) DO NOTHING`,
+        [guruId]
+      );
+      profileResult = await pool.query(
+        `SELECT licence_balance, level FROM guru_profiles WHERE user_id = $1 LIMIT 1`,
+        [guruId]
+      );
+    }
+
+    if (profileResult.rowCount === 0) {
+      return fail(res, req, 404, "NOT_FOUND", "Guru licence profile could not be initialized");
+    }
+
+    const earnedResult = await pool.query(
+      `SELECT
+         COALESCE(SUM(amount), 0)::bigint AS total_pence,
+         COALESCE(SUM(CASE
+           WHEN COALESCE(UPPER(metadata_json->>'status'), 'PROJECTED') = 'CONFIRMED'
+           THEN amount ELSE 0 END), 0)::bigint AS confirmed_pence,
+         COALESCE(SUM(CASE
+           WHEN COALESCE(UPPER(metadata_json->>'status'), 'PROJECTED') = 'PROJECTED'
+           THEN amount ELSE 0 END), 0)::bigint AS projected_pence
+       FROM credit_ledger
+       WHERE user_id = $1
+         AND role = 'guru'
+         AND entry_type = 'CREDIT_ALLOCATION'
+         AND COALESCE((metadata_json->>'void')::boolean, false) IS NOT TRUE
+         AND COALESCE((metadata_json->>'ledger_void')::boolean, false) IS NOT TRUE`,
+      [guruId]
+    );
+
+    const totalEarnedFromPromoters = Number(earnedResult.rows[0]?.total_pence || 0) / 100;
+    const confirmedEarnedFromPromoters = Number(earnedResult.rows[0]?.confirmed_pence || 0) / 100;
+    const projectedEarnedFromPromoters = Number(earnedResult.rows[0]?.projected_pence || 0) / 100;
+
+    const clearedFee = Math.min(GURU_LICENCE_TOTAL, totalEarnedFromPromoters);
+    const balanceOwed = Math.max(0, GURU_LICENCE_TOTAL - clearedFee);
+    const isCleared = balanceOwed <= 0;
+
+    return ok(res, req, {
+      currency: "EUR",
+      totalFee: Number(GURU_LICENCE_TOTAL.toFixed(2)),
+      clearedFee: Number(clearedFee.toFixed(2)),
+      balanceOwed: Number(balanceOwed.toFixed(2)),
+      isCleared,
+      source: {
+        earningsType: "credit_ledger.CREDIT_ALLOCATION (role=guru)",
+        totalEarnedFromPromoters: Number(totalEarnedFromPromoters.toFixed(2)),
+        confirmedEarnedFromPromoters: Number(confirmedEarnedFromPromoters.toFixed(2)),
+        projectedEarnedFromPromoters: Number(projectedEarnedFromPromoters.toFixed(2)),
+      },
+      profileSnapshot: {
+        level: Number(profileResult.rows[0].level || 1),
+        licenceBalanceField: profileResult.rows[0].licence_balance != null
+          ? Number(profileResult.rows[0].licence_balance)
+          : null,
+      },
+    });
+  } catch (err) {
+    console.error("Get guru licence balance error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to retrieve guru licence balance");
+  }
+}
+
 module.exports = {
-  getLicenseInfo
+  getLicenseInfo,
+  getLicenseBalance,
 };

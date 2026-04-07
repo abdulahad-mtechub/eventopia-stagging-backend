@@ -2,6 +2,7 @@ const pool = require("../db");
 const bcrypt = require("bcryptjs");
 const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
 const { getWalletMeForUser } = require("../services/walletMe.service");
+const { ensureShareableReferralLinkForPromoter } = require("../services/promoterReferral.service");
 
 /**
  * Setup Promoter Account (complete profile)
@@ -428,6 +429,7 @@ async function getMyProfile(req, res) {
     const promoter = user;
 
     let credit = null;
+    let referral = null;
     if (isApprovedPromoter) {
       const wr = await getWalletMeForUser(userId, ["promoter"]);
       if (wr.ok) {
@@ -449,6 +451,12 @@ async function getMyProfile(req, res) {
           walletUnavailable: true,
           reason: wr.code === "NO_WALLET" ? "no_credit_wallet" : "wallet_access_blocked",
         };
+      }
+
+      try {
+        referral = await ensureShareableReferralLinkForPromoter(userId);
+      } catch (e) {
+        referral = null;
       }
     }
 
@@ -476,6 +484,7 @@ async function getMyProfile(req, res) {
             status: promoter.application_status
           } : null,
           credit,
+          referral,
         },
       },
     });
