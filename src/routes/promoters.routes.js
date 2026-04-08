@@ -4,6 +4,10 @@ const { requireAuth } = require("../middlewares/auth.middleware");
 const { requireActivePromoter, requireEventOwnership, requireTicketTypeOwnership } = require("../middlewares/auth.middleware");
 const { upload } = require("../middlewares/upload.middleware");
 const { createEventLimiter, updateEventLimiter, /* statusChangeLimiter, */ updateTicketTypeLimiter, createOrderLimiter } = require("../middlewares/rateLimiter.middleware");
+const {
+  createReferralLink,
+  listPromoterReferrals,
+} = require("../controllers/promoterReferrals.controller");
 
 // Promoter account management routes
 const {
@@ -86,6 +90,10 @@ router.patch("/applications/me", editApplication);
 router.get("/me", getMyProfile);
 
 router.post("/applications/:id/payments", payActivationFee);
+
+// Promoter -> Promoter referral APIs (Flow 1)
+router.post("/referral/link", requireActivePromoter, createReferralLink);
+router.get("/referrals", requireActivePromoter, listPromoterReferrals);
 
 /**
  * Promoter Dashboard Overview

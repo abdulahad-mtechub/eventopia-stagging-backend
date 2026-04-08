@@ -525,6 +525,7 @@ CREATE TABLE IF NOT EXISTS guru_applications (
   network_manager_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
   invite_token TEXT UNIQUE,
   avatar_url TEXT,
+  contract_name TEXT,
   agreed_to_terms BOOLEAN NOT NULL DEFAULT FALSE,
   agreed_to_guru_agreement BOOLEAN NOT NULL DEFAULT FALSE,
   account_status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
@@ -552,6 +553,7 @@ BEGIN
   ALTER TABLE guru_applications ADD COLUMN IF NOT EXISTS activation_fee_payment_method TEXT;
   ALTER TABLE guru_applications ADD COLUMN IF NOT EXISTS activation_fee_committed_at TIMESTAMPTZ;
   ALTER TABLE guru_applications ADD COLUMN IF NOT EXISTS phone TEXT;
+  ALTER TABLE guru_applications ADD COLUMN IF NOT EXISTS contract_name TEXT;
 END $$;
 
 /* ================================
@@ -988,6 +990,57 @@ CREATE TABLE IF NOT EXISTS user_attributions (
 
 CREATE INDEX IF NOT EXISTS idx_user_attributions_guru ON user_attributions(guru_id);
 CREATE INDEX IF NOT EXISTS idx_user_attributions_user ON user_attributions(user_id);
+
+/* ================================
+   Promoter -> Promoter Referrals (Flow 1)
+   ================================ */
+CREATE TABLE IF NOT EXISTS territory_referral_pool (
+  territory_code TEXT PRIMARY KEY,
+  pool_total BIGINT NOT NULL,
+  pool_remaining BIGINT NOT NULL,
+  total_paid_out BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS promoter_referrals (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  referrer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  referred_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  guru_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  territory_code TEXT NOT NULL DEFAULT 'UK',
+  referral_link_token TEXT UNIQUE NOT NULL,
+  start_date TIMESTAMPTZ,
+  expiry_date TIMESTAMPTZ,
+  ticket_count INT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'link_issued',
+  payout_amount BIGINT NOT NULL DEFAULT 17250,
+  payout_scheduled_date TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_promoter_referrals_referrer ON promoter_referrals(referrer_id);
+CREATE INDEX IF NOT EXISTS idx_promoter_referrals_referred ON promoter_referrals(referred_id);
+CREATE INDEX IF NOT EXISTS idx_promoter_referrals_status ON promoter_referrals(status);
+CREATE INDEX IF NOT EXISTS idx_promoter_referrals_expiry ON promoter_referrals(expiry_date);
+
+CREATE TABLE IF NOT EXISTS promoter_referral_payouts (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  referral_id BIGINT NOT NULL UNIQUE REFERENCES promoter_referrals(id) ON DELETE CASCADE,
+  referrer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  payout_amount BIGINT NOT NULL DEFAULT 17250,
+  scheduled_at TIMESTAMPTZ NOT NULL,
+  approved_at TIMESTAMPTZ,
+  approved_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  paid_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'payout_pending',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_promoter_referral_payouts_status ON promoter_referral_payouts(status);
+CREATE INDEX IF NOT EXISTS idx_promoter_referral_payouts_schedule ON promoter_referral_payouts(scheduled_at);
 
 /* ================================
    Signup Fee Tracking

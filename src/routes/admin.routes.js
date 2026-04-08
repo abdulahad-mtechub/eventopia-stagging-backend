@@ -50,6 +50,8 @@ const {
   rejectTerritoryApplication,
   updateTerritory,
   suspendTerritoryLicence,
+  getReferralPool,
+  approveReferralPayoutByAdmin,
 } = require("../controllers/admin.controller");
 
 const {
@@ -65,6 +67,9 @@ router.use(requireAuth);
 router.get("/kings-account/events/pending-approval", requireRole("kings_account", "founder", "admin"), listPendingApprovalEvents);
 router.post("/kings-account/events/:eventId/approve", requireRole("kings_account", "founder", "admin"), approvePendingEvent);
 router.post("/kings-account/events/:eventId/cancel", requireRole("kings_account", "founder", "admin"), cancelEvent);
+// Promoter -> Promoter referral payout admin APIs (Flow 1)
+router.get("/referral-pool", requireRole("kings_account", "founder", "admin"), getReferralPool);
+router.post("/referrals/:id/approve-payout", requireRole("kings_account", "founder", "admin"), approveReferralPayoutByAdmin);
 
 router.use(requireFounderOrAdmin);
 

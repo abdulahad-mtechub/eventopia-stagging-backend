@@ -18,6 +18,10 @@ const {
   ensurePromoterCreditWallet,
   ensurePromoterCreditWalletIfActivePromoter,
 } = require("../services/promoterCreditWallet.service");
+const {
+  claimReferralOnRegister,
+  ensureShareableReferralLinkForPromoter,
+} = require("../services/promoterReferral.service");
 const { getWalletMeForUser } = require("../services/walletMe.service");
 function isValidEmail(email) {
   return /^(?!\.)(?!.*\.\.)([A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(email);
@@ -711,7 +715,21 @@ async function setupAccount(req, res) {
 ======================= */
 async function register(req, res) {
   try {
-    const { email, password, name, city, deviceId, guruCode, role, role_requested, invite_token, device_token } = req.body;
+    const {
+      email,
+      password,
+      name,
+      city,
+      deviceId,
+      guruCode,
+      role,
+      role_requested,
+      invite_token,
+      device_token,
+      referral_token,
+      ref,
+    } = req.body;
+    const promoterReferralToken = (referral_token || ref || req.query?.ref || "").trim();
 
     // Collect exact validation errors
     const errors = [];
@@ -792,6 +810,14 @@ async function register(req, res) {
     // Handle role_requested for Network Manager, Guru, and Promoter flows
     const isGuruRequest = role_requested === "guru" || role === "guru";
     const isPromoterRequest = role_requested === "promoter" || role === "promoter";
+
+    if (promoterReferralToken && !isPromoterRequest) {
+      return res.status(400).json({
+        error: true,
+        message: "Referral token can only be used for promoter registration.",
+        data: null,
+      });
+    }
 
     // Validate role if provided
     const allowedSelfAssignRoles = ["buyer", "promoter", "guru"];
@@ -901,6 +927,27 @@ async function register(req, res) {
 
     const user = userResult.rows[0];
 
+    // Promoter -> Promoter referral token claim on registration.
+    // This starts the 90-day window and locks guru attribution via user_attributions.
+    if (promoterReferralToken) {
+      try {
+        await claimReferralOnRegister({
+          token: promoterReferralToken,
+          referredUserId: user.id,
+        });
+      } catch (claimErr) {
+        try {
+          await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
+        } catch (_) {}
+        const status = claimErr.status || 400;
+        return res.status(status).json({
+          error: true,
+          message: claimErr.message || "Unable to apply referral token.",
+          data: null,
+        });
+      }
+    }
+
     if (user.role === "promoter") {
       const wClient = await pool.connect();
       try {
@@ -915,6 +962,12 @@ async function register(req, res) {
       } finally {
         wClient.release();
       }
+
+      // UX helper: pre-provision a shareable referral link for profile page.
+      // This is best-effort and must not block registration.
+      try {
+        await ensureShareableReferralLinkForPromoter(user.id);
+      } catch (_) {}
     }
 
     // If user registered via invite, mark invite as used and handle special flows
@@ -3384,7 +3437,7 @@ async function resendGuruInvite(req, res) {
  * - Invalidate invite token immediately after successful registration to prevent reuse
  * - Reject duplicate email registration
  * 
- * Request: { invite_token, name, password, phone }
+ * Request: { invite_token, name, contract_name, password, phone }
  * Response: { access_token, refresh_token, user: { id, name, email, role, network_manager_id, credit_balance: -295, level: 1, sprint_active: false } }
  * 
  * Error Responses:
@@ -3396,12 +3449,15 @@ async function resendGuruInvite(req, res) {
 async function guruRegisterViaInvite(req, res) {
   const client = await pool.connect();
   try {
-    const { invite_token, name, password, phone } = req.body;
+    const { invite_token, name, contract_name, password, phone } = req.body;
 
     // VALIDATION: All fields are required
     const errors = [];
     if (!invite_token) errors.push("Invite token is required.");
     if (!name || typeof name !== "string" || name.trim().length === 0) errors.push("Name is required.");
+    if (!contract_name || typeof contract_name !== "string" || contract_name.trim().length === 0) {
+      errors.push("Contract name is required.");
+    }
     if (!password) errors.push("Password is required.");
     if (!phone) errors.push("Phone number is required.");
 
@@ -3560,6 +3616,24 @@ async function guruRegisterViaInvite(req, res) {
       }
     }
 
+    // STEP 4B: Store Guru application metadata from invite registration
+    await client.query(
+      `INSERT INTO guru_applications
+        (user_id, network_manager_user_id, contract_name, phone, agreed_to_terms, agreed_to_guru_agreement, account_status, reviewed_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, TRUE, TRUE, 'approved', NOW(), NOW(), NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET contract_name = EXCLUDED.contract_name,
+           phone = EXCLUDED.phone,
+           network_manager_user_id = EXCLUDED.network_manager_user_id,
+           updated_at = NOW()`,
+      [
+        user.id,
+        inviteData.network_manager_user_id || null,
+        contract_name.trim(),
+        phone,
+      ]
+    );
+
     // STEP 5: Invalidate invite token
     // console.log(`[GURU REGISTER] Invalidating invite token`);
     await client.query(
@@ -3608,6 +3682,7 @@ async function guruRegisterViaInvite(req, res) {
           role: 'GURU',
           network_manager_id: inviteData.network_manager_user_id || null,
           network_manager_name: inviteData.network_manager_name || null,
+          contract_name: contract_name.trim(),
           credit_balance: -295,
           level: 1,
           sprint_active: false,

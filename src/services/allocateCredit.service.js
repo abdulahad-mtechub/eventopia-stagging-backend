@@ -5,6 +5,11 @@
 
 const pool = require("../db");
 const { createLedgerEntry } = require("./ledgerCore.service");
+const {
+  getActiveReferralByReferredPromoter,
+  applyReferralTicketProgress,
+  REFERRAL_PER_TICKET_PENCE,
+} = require("./promoterReferral.service");
 
 // Per-ticket credit split in pence by tier (Promoter, Guru, Network Manager). Eventopia share not credited to a role.
 const TIER_CREDIT_SPLITS_PENCE = {
@@ -66,6 +71,31 @@ async function allocateCredit(
     },
   ].filter((e) => e.user_id != null && e.amount_pence > 0);
 
+  // Promoter -> Promoter referral mode:
+  // divert £0.30/ticket from guru share to referrer while referral is active.
+  const activeReferral = await getActiveReferralByReferredPromoter(promoter_id);
+  if (activeReferral) {
+    const diversionPerTicket = REFERRAL_PER_TICKET_PENCE;
+    const referralAmount = diversionPerTicket * quantity;
+
+    const guruEntry = entries.find((e) => e.role === "guru");
+    if (guruEntry) {
+      const diverted = Math.min(guruEntry.amount_pence, referralAmount);
+      guruEntry.amount_pence = guruEntry.amount_pence - diverted;
+      if (guruEntry.amount_pence <= 0) {
+        const idx = entries.findIndex((e) => e.role === "guru");
+        if (idx >= 0) entries.splice(idx, 1);
+      }
+      if (diverted > 0) {
+        entries.push({
+          role: "referrer",
+          user_id: activeReferral.referrer_id,
+          amount_pence: diverted,
+        });
+      }
+    }
+  }
+
   if (client) await client.query("BEGIN");
 
   try {
@@ -107,6 +137,11 @@ async function allocateCredit(
     }
 
     if (client) await client.query("COMMIT");
+
+    // Increment referral ticket tracker and evaluate payout trigger.
+    if (activeReferral) {
+      await applyReferralTicketProgress(activeReferral.id, quantity);
+    }
   } catch (err) {
     if (client) await client.query("ROLLBACK");
     throw err;

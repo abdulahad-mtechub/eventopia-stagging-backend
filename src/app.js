@@ -7,10 +7,18 @@ const usersRoutes = require("./routes/users.routes");
 const apiRoutes = require("./routes"); // central router: mounts /auth, /network-managers, /territories, etc.
 const { requestMeta } = require("./middlewares/requestMeta.middleware");
 const { trackEventView } = require("./middlewares/viewTracking.middleware");
+const { handleStripeOrdersWebhook } = require("./controllers/stripeWebhooks.controller");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const app = express();
 const { initScheduler } = require("./services/scheduler.service");
+
+// Stripe webhooks need the raw body for signature verification (must be before express.json()).
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  handleStripeOrdersWebhook
+);
 
 app.use(express.json());
 app.use(cookieParser());

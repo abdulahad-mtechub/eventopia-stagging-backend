@@ -2,56 +2,25 @@
 // Implements ONLY the 5 endpoints defined in Module 3 — Ticket Purchase Flow
 
 const pool = require("../db");
+const { getStripe } = require("../services/stripeClient");
 
 const crypto = require("crypto");
 const { ok, fail } = require("../utils/standardResponse");
+const { signQRHash, verifyQRHash } = require("../utils/ticketQr.util");
 
-const { receiveTicketPayment } = require("../services/escrowReceive.service");
-const { allocateCredit } = require("../services/allocateCredit.service");
-const { resolveTier } = require("../services/tierResolver.service");
+const {
+  createCheckoutSessionForOrder,
+  persistStripePaymentIntent,
+  assertPaymentIntentSucceededForOrder,
+  enrichOrderPaymentFields,
+  isStripeConfigured,
+} = require("../services/orderStripePayment.service");
+const {
+  fulfillLockedOrderPaymentSuccess,
+  runPostFulfillmentSideEffects,
+} = require("../services/orderFulfillment.service");
 const { logTicketAudit } = require("../services/audit.service");
 const { logValidationAttempt } = require("../services/validationLog.service");
-// done data commit?
-// ─────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────
-
-/**
- * Sign a payload into a SHA-256 HMAC hash used as the QR code hash.
- * SECRET must be set in environment variables.
- */
-const signQRHash = (payload) => {
-  const secret = process.env.QR_SECRET || "changeme_secret";
-  return crypto
-    .createHmac("sha256", secret)
-    .update(JSON.stringify(payload))
-    .digest("hex");
-};
-
-/**
- * Build the QR payload and its signed hash for an order item / ticket.
- */
-const buildQR = ({ ticketItemId, orderId, eventId, buyerId, attendeeName, tierName }) => {
-  // Keep response payload field names snake_case as in Module 3 document.
-  const qrPayload = {
-    ticket_item_id: ticketItemId,
-    order_id: orderId,
-    event_id: eventId,
-    buyer_id: buyerId,
-    attendee_name: attendeeName,
-    tier_name: tierName,
-  };
-  const qrCodeHash = signQRHash(qrPayload);
-  return { qrPayload, qrCodeHash };
-};
-
-/**
- * Verify a raw QR hash against a known payload.
- */
-const verifyQRHash = (hash, payload) => {
-  const expected = signQRHash(payload);
-  return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(expected, "hex"));
-};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -124,7 +93,9 @@ const createOrder = async (req, res) => {
          o.booking_fee_amount,
          o.total_amount,
          o.expires_at,
+         o.payment_status,
          o.payment_intent_id,
+         o.payment_provider,
          (
            SELECT COALESCE(
              json_agg(json_build_object(
@@ -150,23 +121,54 @@ const createOrder = async (req, res) => {
     if (idempCheck.rowCount > 0) {
       await client.query("ROLLBACK");
       const existing = idempCheck.rows[0];
-      return ok(
-        res,
-        req,
-        {
-          order: {
-            id: existing.id,
-            status: "pending",
-            total_ticket_amount: Number(existing.subtotal_amount) / 100,
-            total_booking_fee: Number(existing.booking_fee_amount) / 100,
-            grand_total: Number(existing.total_amount) / 100,
-            expires_at: existing.expires_at,
-            payment_intent_ref: existing.payment_intent_id,
-            items: existing.items_json || [],
-          },
-        },
-        200
-      );
+      const unpaid = existing.payment_status === "unpaid" || existing.payment_status === "UNPAID";
+      const noRealPi =
+        !existing.payment_intent_id || !String(existing.payment_intent_id).startsWith("pi_");
+      if (unpaid && noRealPi && isStripeConfigured()) {
+        try {
+          const frontendBase = process.env.FRONTEND_URL || "http://localhost:5173";
+          const successUrl = `${frontendBase.replace(/\/$/, "")}/checkout/success?order_id=${existing.id}&session_id={CHECKOUT_SESSION_ID}`;
+          const cancelUrl = `${frontendBase.replace(/\/$/, "")}/checkout/cancel?order_id=${existing.id}`;
+          const { id: sessionId, url: checkoutUrl, payment_intent: piId } = await createCheckoutSessionForOrder({
+            orderId: existing.id,
+            totalAmountPence: Number(existing.total_amount),
+            currency: "GBP",
+            successUrl,
+            cancelUrl,
+            idempotencyKey: idempotency_key,
+          });
+          if (piId && String(piId).startsWith("pi_")) {
+            await persistStripePaymentIntent(existing.id, piId);
+            existing.payment_intent_id = piId;
+          } else {
+            await pool.query(
+              `UPDATE orders SET payment_provider = 'stripe', updated_at = NOW() WHERE id = $1`,
+              [existing.id]
+            );
+          }
+          existing.payment_provider = "stripe";
+          existing.stripe_checkout_session_id = sessionId;
+          existing.stripe_checkout_url = checkoutUrl;
+        } catch (e) {
+          console.error("createOrder: idempotent Stripe attach failed:", e.message);
+        }
+      }
+      const baseOrder = {
+        id: existing.id,
+        status: "pending",
+        total_ticket_amount: Number(existing.subtotal_amount) / 100,
+        total_booking_fee: Number(existing.booking_fee_amount) / 100,
+        grand_total: Number(existing.total_amount) / 100,
+        expires_at: existing.expires_at,
+        payment_intent_ref: existing.payment_intent_id,
+        items: existing.items_json || [],
+      };
+      const orderPayload = await enrichOrderPaymentFields(baseOrder, existing);
+      if (existing.stripe_checkout_url) {
+        orderPayload.stripe_checkout_url = existing.stripe_checkout_url;
+        orderPayload.stripe_checkout_session_id = existing.stripe_checkout_session_id || null;
+      }
+      return ok(res, req, { order: orderPayload }, 200);
     }
 
     // ── Per-ticket type validation & fee calculation ─────────────────────────
@@ -233,7 +235,9 @@ const createOrder = async (req, res) => {
     }
 
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-    const paymentIntentRef = "stub_pi_abc123";
+    const useStripe = isStripeConfigured();
+    const paymentIntentRef = useStripe ? null : "stub_pi_abc123";
+    const paymentProviderInsert = useStripe ? "stripe_pending" : "stub";
     const orderNumber = `EVT-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
 
     const orderInsert = await client.query(
@@ -251,7 +255,7 @@ const createOrder = async (req, res) => {
          payment_provider,
          expires_at,
          idempotency_key
-       ) VALUES ($1,$2,$3,$4,$5,$6,'GBP','payment_pending','unpaid',$7,'stub',$8,$9)
+       ) VALUES ($1,$2,$3,$4,$5,$6,'GBP','payment_pending','unpaid',$7,$8,$9,$10)
        RETURNING id`,
       [
         orderNumber,
@@ -261,6 +265,7 @@ const createOrder = async (req, res) => {
         totalBookingFeePence,
         totalTicketPence + totalBookingFeePence,
         paymentIntentRef,
+        paymentProviderInsert,
         expiresAt,
         idempotency_key,
       ]
@@ -318,23 +323,72 @@ const createOrder = async (req, res) => {
 
     await client.query("COMMIT");
 
-    return ok(
-      res,
-      req,
-      {
-        order: {
-          id: orderId,
-          status: "pending",
-          total_ticket_amount: totalTicketPence / 100,
-          total_booking_fee: totalBookingFeePence / 100,
-          grand_total: (totalTicketPence + totalBookingFeePence) / 100,
-          expires_at: expiresAt,
-          payment_intent_ref: paymentIntentRef,
-          items: responseItems,
-        },
-      },
-      201
-    );
+    let finalPaymentIntentRef = paymentIntentRef;
+    let rowForEnrich = {
+      payment_intent_id: paymentIntentRef,
+      payment_provider: paymentProviderInsert,
+    };
+    let baseOrderStripe = null;
+
+    if (useStripe) {
+      try {
+        const frontendBase = process.env.FRONTEND_URL || "http://localhost:5173";
+        const successUrl = `${frontendBase.replace(/\/$/, "")}/checkout/success?order_id=${orderId}&session_id={CHECKOUT_SESSION_ID}`;
+        const cancelUrl = `${frontendBase.replace(/\/$/, "")}/checkout/cancel?order_id=${orderId}`;
+        const { id: sessionId, url: checkoutUrl, payment_intent: piId } = await createCheckoutSessionForOrder({
+          orderId,
+          totalAmountPence: totalTicketPence + totalBookingFeePence,
+          currency: "GBP",
+          successUrl,
+          cancelUrl,
+          idempotencyKey: idempotency_key,
+        });
+        if (piId && String(piId).startsWith("pi_")) {
+          await persistStripePaymentIntent(orderId, piId);
+          finalPaymentIntentRef = piId;
+          rowForEnrich = { payment_intent_id: piId, payment_provider: "stripe" };
+        } else {
+          await pool.query(
+            `UPDATE orders
+             SET payment_provider = 'stripe', updated_at = NOW()
+             WHERE id = $1`,
+            [orderId]
+          );
+          finalPaymentIntentRef = null;
+          rowForEnrich = { payment_intent_id: null, payment_provider: "stripe" };
+        }
+        baseOrderStripe = {
+          stripe_checkout_url: checkoutUrl,
+          stripe_checkout_session_id: sessionId,
+        };
+      } catch (stripeErr) {
+        console.error("createOrder: Stripe Checkout session failed:", stripeErr);
+        return fail(
+          res,
+          req,
+          503,
+          "PAYMENT_SETUP_FAILED",
+          "Could not start payment. Please try again or contact support."
+        );
+      }
+    }
+
+    const baseOrder = {
+      id: orderId,
+      status: "pending",
+      total_ticket_amount: totalTicketPence / 100,
+      total_booking_fee: totalBookingFeePence / 100,
+      grand_total: (totalTicketPence + totalBookingFeePence) / 100,
+      expires_at: expiresAt,
+      payment_intent_ref: finalPaymentIntentRef,
+      items: responseItems,
+    };
+    const orderPayload = await enrichOrderPaymentFields(baseOrder, rowForEnrich);
+    if (useStripe && typeof baseOrderStripe === "object") {
+      orderPayload.stripe_checkout_url = baseOrderStripe.stripe_checkout_url || null;
+      orderPayload.stripe_checkout_session_id = baseOrderStripe.stripe_checkout_session_id || null;
+    }
+    return ok(res, req, { order: orderPayload }, 201);
 
   } catch (err) {
     await client.query("ROLLBACK");
@@ -539,204 +593,184 @@ const confirmOrder = async (req, res) => {
 
     const order = orderResult.rows[0];
 
-    if (order.payment_intent_id !== payment_ref) {
+    const isAdmin = Array.isArray(req.userRoles) && req.userRoles.includes("admin");
+    if (order.buyer_user_id !== req.user.id && !isAdmin) {
       await client.query("ROLLBACK");
-      console.log("[confirmOrder:payment-ref-mismatch]", { orderId, ms: Date.now() - startedAt });
-      return fail(res, req, 400, "VALIDATION_ERROR", "payment_ref does not match order");
+      return fail(res, req, 403, "FORBIDDEN", "You cannot confirm this order");
     }
 
+    const isStripeOrder =
+      order.payment_provider === "stripe" ||
+      (order.payment_intent_id && String(order.payment_intent_id).startsWith("pi_"));
+
     const alreadyConfirmed =
-      order.payment_status === "paid" || order.payment_status === "PAID" || order.status === "confirmed" || order.confirmed_at;
+      order.payment_status === "paid" ||
+      order.payment_status === "PAID" ||
+      order.status === "confirmed" ||
+      order.confirmed_at;
 
     if (alreadyConfirmed) {
       await client.query("ROLLBACK");
       console.log("[confirmOrder:already-confirmed]", { orderId, ms: Date.now() - startedAt });
+      if (isStripeOrder) {
+        return ok(res, req, {
+          order: { id: order.id, status: "completed" },
+          already_completed: true,
+          escrow_entry_created: true,
+          confirmation_email_sent: false,
+        });
+      }
       return fail(res, req, 400, "ALREADY_COMPLETED", "Order already confirmed");
     }
 
-    // ── Update order status ───────────────────────────────────────────────────
-    await client.query(
-      "UPDATE orders SET status = 'confirmed', payment_status = 'paid', confirmed_at = NOW() WHERE id = $1",
-      [orderId]
-    );
+    if (isStripeOrder) {
+      if (!isStripeConfigured()) {
+        await client.query("ROLLBACK");
+        return fail(res, req, 503, "STRIPE_NOT_CONFIGURED", "Stripe is not configured");
+      }
 
-    // ── Fetch order items (one row per attendee ticket) ─────────────────────
-    console.log("[confirmOrder:before-fetch-order-items]", { orderId, ms: Date.now() - startedAt });
-    const itemsResult = await client.query(
-      `SELECT
-         oi.id AS order_item_id,
-         oi.ticket_type_id,
-         oi.ticket_name AS tier_name,
-         oi.ticket_price_amount,
-         oi.ticket_booking_fee_amount,
-         oi.quantity,
-         oi.buyer_name AS attendee_name,
-         oi.buyer_email
-       FROM order_items oi
-       WHERE oi.order_id = $1
-       ORDER BY oi.id`,
-      [orderId]
-    );
-    console.log("[confirmOrder:after-fetch-order-items]", {
-      orderId,
-      itemRows: itemsResult.rowCount,
-      ms: Date.now() - startedAt,
-    });
+      if (!order.payment_intent_id) {
+        const checkoutSessionId =
+          typeof payment_ref === "string" && payment_ref.startsWith("cs_")
+            ? payment_ref
+            : null;
 
-    const responseItems = [];
-    const qtyByTicketType = {}; // ticket_type_id -> quantity
+        if (checkoutSessionId) {
+          try {
+            console.log("[BACKEND][confirmOrder][stripe-session-verify-start]", {
+              orderId: order.id,
+              checkoutSessionId,
+            });
+            const stripe = getStripe();
+            const session = await stripe.checkout.sessions.retrieve(checkoutSessionId, {
+              expand: ["payment_intent"],
+            });
 
-    function generateTicketCode() {
-      return "TKT-" + crypto.randomBytes(6).toString("hex").toUpperCase();
-    }
+            const metaOrderId = session?.metadata?.orderId
+              ? parseInt(session.metadata.orderId, 10)
+              : null;
+            if (metaOrderId && metaOrderId !== Number(order.id)) {
+              console.warn("[BACKEND][confirmOrder][stripe-session-metadata-mismatch]", {
+                orderId: order.id,
+                checkoutSessionId,
+                metadataOrderId: metaOrderId,
+              });
+              await client.query("ROLLBACK");
+              return fail(res, req, 400, "PAYMENT_VERIFICATION_FAILED", "Checkout session metadata mismatch");
+            }
+            if (session.payment_status !== "paid") {
+              console.warn("[BACKEND][confirmOrder][stripe-session-not-paid]", {
+                orderId: order.id,
+                checkoutSessionId,
+                sessionPaymentStatus: session.payment_status,
+              });
+              await client.query("ROLLBACK");
+              return fail(res, req, 402, "PAYMENT_PENDING", `Checkout session status: ${session.payment_status || "unknown"}`);
+            }
 
-    // Mint tickets + compute/store deterministic QR hash in tickets.qr_code_data
-    for (const item of itemsResult.rows) {
-      const qty = item.quantity || 1;
-      qtyByTicketType[item.ticket_type_id] = (qtyByTicketType[item.ticket_type_id] || 0) + qty;
+            const piId =
+              typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id || null;
 
-      for (let i = 0; i < qty; i++) {
-        const ticketInsert = await client.query(
-          `INSERT INTO tickets (
-             order_item_id,
-             order_id,
-             event_id,
-             ticket_type_id,
-             ticket_code,
-             buyer_name,
-             buyer_email,
-             status,
-             user_id,
-             issued_at
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',$8,NOW())
-           RETURNING id`,
-          [
-            item.order_item_id,
-            orderId,
-            order.event_id,
-            item.ticket_type_id,
-            generateTicketCode(),
-            item.attendee_name,
-            item.buyer_email || "",
-            order.buyer_user_id,
-          ]
-        );
+            if (!piId || !String(piId).startsWith("pi_")) {
+              console.warn("[BACKEND][confirmOrder][stripe-session-missing-payment-intent]", {
+                orderId: order.id,
+                checkoutSessionId,
+                paymentIntentType: typeof session.payment_intent,
+              });
+              await client.query("ROLLBACK");
+              return fail(res, req, 402, "PAYMENT_PENDING", "Payment intent is not ready yet");
+            }
 
-        const ticketId = ticketInsert.rows[0].id;
-        const { qrPayload, qrCodeHash } = buildQR({
-          ticketItemId: ticketId,
-          orderId: orderId,
-          eventId: order.event_id,
-          buyerId: order.buyer_user_id,
-          attendeeName: item.attendee_name,
-          tierName: item.tier_name,
-        });
+            await client.query(
+              `UPDATE orders
+               SET payment_intent_id = $1, payment_provider = 'stripe', updated_at = NOW()
+               WHERE id = $2`,
+              [piId, order.id]
+            );
+            order.payment_intent_id = piId;
+            order.payment_provider = "stripe";
+            console.log("[BACKEND][confirmOrder][stripe-session-verify-success]", {
+              orderId: order.id,
+              checkoutSessionId,
+              paymentIntentId: piId,
+            });
+          } catch (sessionErr) {
+            console.error("[BACKEND][confirmOrder][stripe-session-verify-failed]", {
+              orderId: order.id,
+              checkoutSessionId,
+              message: sessionErr?.message,
+              code: sessionErr?.code,
+              type: sessionErr?.type,
+            });
+            await client.query("ROLLBACK");
+            return fail(
+              res,
+              req,
+              400,
+              "PAYMENT_VERIFICATION_FAILED",
+              sessionErr?.message || "Could not verify Stripe checkout session"
+            );
+          }
+        } else {
+          console.warn("[BACKEND][confirmOrder][stripe-missing-payment-ref]", {
+            orderId: order.id,
+            paymentProvider: order.payment_provider,
+            paymentIntentId: order.payment_intent_id || null,
+            incomingPaymentRef: payment_ref || null,
+          });
+          await client.query("ROLLBACK");
+          return fail(
+            res,
+            req,
+            409,
+            "ORDER_NOT_READY",
+            "Payment is still being finalized. Please retry in a moment."
+          );
+        }
+      }
 
-        await client.query(
-          `UPDATE tickets
-           SET qr_code_data = $1
-           WHERE id = $2`,
-          [qrCodeHash, ticketId]
-        );
-
-        // Document route: GET /api/buyer/tickets/:itemId/qr
-        const qrCodeUrl = `/api/buyer/tickets/${ticketId}/qr`;
-        responseItems.push({
-          id: ticketId,
-          attendee_name: item.attendee_name,
-          tier_name: item.tier_name,
-          ticket_price: Number(item.ticket_price_amount) / 100,
-          booking_fee: Number(item.ticket_booking_fee_amount) / 100,
-          qr_code_hash: qrCodeHash,
-          qr_code_url: qrCodeUrl,
-        });
+      try {
+        await assertPaymentIntentSucceededForOrder(order);
+      } catch (e) {
+        await client.query("ROLLBACK");
+        if (e.code === "PAYMENT_NOT_SUCCEEDED") {
+          return fail(res, req, 402, "PAYMENT_PENDING", `Payment status: ${e.stripeStatus || "unknown"}`);
+        }
+        return fail(res, req, 400, "PAYMENT_VERIFICATION_FAILED", e.message || "Payment verification failed");
+      }
+    } else {
+      if (order.payment_intent_id !== payment_ref) {
+        await client.query("ROLLBACK");
+        console.log("[confirmOrder:payment-ref-mismatch]", { orderId, ms: Date.now() - startedAt });
+        return fail(res, req, 400, "VALIDATION_ERROR", "payment_ref does not match order");
       }
     }
 
-    // ── Consume reservations + increment inventory sold ──────────────────────
-    await client.query(
-      `UPDATE inventory_reservations
-       SET status = 'consumed'
-       WHERE order_id = $1 AND status = 'active'`,
-      [orderId]
-    );
-
-    for (const [ticketTypeId, qty] of Object.entries(qtyByTicketType)) {
-      await client.query(
-        `UPDATE ticket_types
-         SET qty_sold = qty_sold + $1
-         WHERE id = $2`,
-        [qty, ticketTypeId]
-      );
-    }
-
-    await client.query(
-      `UPDATE events
-       SET tickets_sold = (
-         SELECT COUNT(*) FROM tickets
-         WHERE event_id = $1 AND status = 'ACTIVE'
-       )
-       WHERE id = $1`,
-      [order.event_id]
-    );
-
-    // Prepare projected credit inputs now; execute financial side-effects after COMMIT
-    // to reduce lock duration on the order row.
-    const qtyByTierLabel = {}; // tier_label -> quantity
-    for (const item of itemsResult.rows) {
-      const tierPricePounds = Number(item.ticket_price_amount) / 100;
-      const { tier_label } = resolveTier(tierPricePounds);
-      qtyByTierLabel[tier_label] = (qtyByTierLabel[tier_label] || 0) + (item.quantity || 1);
-    }
-
+    console.log("[confirmOrder:before-fulfill]", { orderId, ms: Date.now() - startedAt });
+    const fulfillResult = await fulfillLockedOrderPaymentSuccess(client, order, orderId);
     console.log("[confirmOrder:before-commit]", {
       orderId,
-      mintedTickets: responseItems.length,
-      distinctTicketTypes: Object.keys(qtyByTicketType).length,
+      mintedTickets: fulfillResult.responseItems?.length ?? 0,
+      alreadyConfirmed: fulfillResult.alreadyConfirmed,
       ms: Date.now() - startedAt,
     });
     await client.query("COMMIT");
     console.log("[confirmOrder:after-commit]", { orderId, ms: Date.now() - startedAt });
 
     let escrowEntryCreated = true;
-    try {
-      // ── Post-commit side effects (no order-row lock held) ───────────────────
-      console.log("[confirmOrder:before-receive-ticket-payment]", { orderId, ms: Date.now() - startedAt });
-      await receiveTicketPayment({
-        territory_id: order.territory_id || 1,
-        escrow_amount_pence: Number(order.subtotal_amount),
-        booking_fee_pence: Number(order.booking_fee_amount),
-        buyer_id: order.buyer_user_id,
-        order_id: orderId,
-        event_id: order.event_id,
-      });
-      console.log("[confirmOrder:after-receive-ticket-payment]", { orderId, ms: Date.now() - startedAt });
-
-      console.log("[confirmOrder:before-allocate-credit-loop]", {
-        orderId,
-        tierCount: Object.keys(qtyByTierLabel).length,
-        ms: Date.now() - startedAt,
-      });
-      for (const [tierLabel, qty] of Object.entries(qtyByTierLabel)) {
-        await allocateCredit({
-          event_id: order.event_id,
-          tier_label: Number(tierLabel),
-          quantity: qty,
-          promoter_id: order.promoter_id,
-          guru_id: order.guru_id,
-          network_manager_id: order.network_manager_id,
-          territory_id: order.territory_id || 1,
-          order_id: orderId,
+    if (!fulfillResult.alreadyConfirmed && fulfillResult.qtyByTierLabel) {
+      try {
+        await runPostFulfillmentSideEffects(fulfillResult.order, orderId, fulfillResult.qtyByTierLabel);
+      } catch (sideEffectErr) {
+        escrowEntryCreated = false;
+        console.error("[confirmOrder:post-commit-side-effect-error]", {
+          orderId,
+          message: sideEffectErr?.message,
+          ms: Date.now() - startedAt,
         });
       }
-      console.log("[confirmOrder:after-allocate-credit-loop]", { orderId, ms: Date.now() - startedAt });
-    } catch (sideEffectErr) {
-      escrowEntryCreated = false;
-      console.error("[confirmOrder:post-commit-side-effect-error]", {
-        orderId,
-        message: sideEffectErr?.message,
-        ms: Date.now() - startedAt,
-      });
     }
 
     console.log("[confirmOrder:done]", { orderId, ms: Date.now() - startedAt, escrowEntryCreated });
@@ -745,10 +779,10 @@ const confirmOrder = async (req, res) => {
       order: {
         id: order.id,
         status: "completed",
-        items: responseItems
+        items: fulfillResult.responseItems || [],
       },
       escrow_entry_created: escrowEntryCreated,
-      confirmation_email_sent: false
+      confirmation_email_sent: false,
     });
 
   } catch (err) {

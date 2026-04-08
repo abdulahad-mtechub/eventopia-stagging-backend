@@ -6,6 +6,7 @@ const { startJob, markJobSuccess, markJobFailed } = require('./jobMonitoring.ser
 const { expireHeldReservations } = require('./territoryReservation.service');
 const { runServiceFeeForMonth } = require('./serviceFeeJob.service');
 const { refreshAllGuruMetrics } = require('./guruMetrics.service');
+const { expireActivePromoterReferrals } = require("./promoterReferral.service");
 
 /**
  * Runs every hour to mark events as completed when they end
@@ -239,6 +240,26 @@ async function sendVoucherExpiryReminders() {
 }
 
 /**
+ * Runs daily to expire promoter referral windows.
+ */
+async function expirePromoterReferralWindows() {
+  let runId = null;
+  try {
+    runId = await startJob("expirePromoterReferralWindows");
+    const count = await expireActivePromoterReferrals();
+    if (count > 0) {
+      console.log(`Expired ${count} promoter referral window(s)`);
+    }
+    await markJobSuccess(runId);
+  } catch (err) {
+    console.error("Error expiring promoter referral windows:", err);
+    if (runId) {
+      await markJobFailed(runId, err.message);
+    }
+  }
+}
+
+/**
  * Initialize scheduled jobs
  */
 function initScheduler() {
@@ -316,6 +337,11 @@ function initScheduler() {
     }
   });
 
+  // Run daily at 1:30 AM - expire promoter referral windows
+  cron.schedule("30 1 * * *", async () => {
+    await expirePromoterReferralWindows();
+  });
+
   console.log("Event completion, reservation expiry, territory reservation expiry, voucher expiry, reminder, and service fee scheduler initialized");
 }
 
@@ -325,5 +351,6 @@ module.exports = {
   expireReservations,
   expireTerritoryReservations,
   expireVouchers,
-  sendVoucherExpiryReminders
+  sendVoucherExpiryReminders,
+  expirePromoterReferralWindows,
 };
