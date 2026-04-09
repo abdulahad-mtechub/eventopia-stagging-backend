@@ -165,19 +165,27 @@ class ReferralService {
         [code, guru.guru_id, userId]
       );
 
-      // Record attribution
-      const attribution = await client.query(
-        `INSERT INTO user_attributions
-          (user_id, guru_id, referral_code, signed_up_via_referral)
-         VALUES ($1, $2, $3, TRUE)
-         ON CONFLICT (user_id) DO UPDATE
+      // Record attribution (no UNIQUE on user_id in all DBs — use update-then-insert, same as promoter referrals)
+      const updatedAttr = await client.query(
+        `UPDATE user_attributions
          SET guru_id = $2, referral_code = $3, signed_up_via_referral = TRUE
+         WHERE user_id = $1
          RETURNING *`,
         [userId, guru.guru_id, code]
       );
+      let attributionRow = updatedAttr.rows[0];
+      if (!attributionRow) {
+        const inserted = await client.query(
+          `INSERT INTO user_attributions (user_id, guru_id, referral_code, signed_up_via_referral)
+           VALUES ($1, $2, $3, TRUE)
+           RETURNING *`,
+          [userId, guru.guru_id, code]
+        );
+        attributionRow = inserted.rows[0];
+      }
 
       await client.query('COMMIT');
-      return attribution.rows[0];
+      return attributionRow;
     } catch (err) {
       await client.query('ROLLBACK');
       console.error('Record signup error:', err);

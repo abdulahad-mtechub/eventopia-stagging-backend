@@ -985,7 +985,8 @@ CREATE TABLE IF NOT EXISTS user_attributions (
   guru_id BIGINT REFERENCES users(id),
   referral_code TEXT,
   signed_up_via_referral BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE (user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_attributions_guru ON user_attributions(guru_id);

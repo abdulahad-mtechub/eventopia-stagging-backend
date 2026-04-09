@@ -1076,16 +1076,67 @@ async function getReferralInfo(req, res) {
       referral = await ReferralService.createReferralCode(guruId);
     }
 
-    const referralLink = `${process.env.FRONTEND_URL}/register?ref=${referral.referral_code}`;
+    const base = String(process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+    const code = encodeURIComponent(referral.referral_code);
+    const referralLink = base
+      ? `${base}/register?referral_token=${code}`
+      : `register?referral_token=${code}`;
 
     return ok(res, req, {
       referralCode: referral.referral_code,
-      referralLink: referralLink,
-      createdAt: referral.created_at
+      referral_token: referral.referral_code,
+      referralLink,
+      createdAt: referral.created_at,
     });
   } catch (err) {
     console.error('Get referral info error:', err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to get referral info");
+  }
+}
+
+/**
+ * Invite Promoters — get or create guru referral link + network stats (Figma invite screen).
+ * POST or GET /gurus/promoters/invite/referral-link
+ */
+async function getInvitePromotersReferralLink(req, res) {
+  try {
+    const guruId = req.user.id;
+
+    let referral = await ReferralService.getReferralInfo(guruId);
+    if (!referral) {
+      referral = await ReferralService.createReferralCode(guruId);
+    }
+
+    const baseUrl = String(process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+    const codeEnc = encodeURIComponent(referral.referral_code);
+    const referralLink = baseUrl
+      ? `${baseUrl}/register?referral_token=${codeEnc}`
+      : `register?referral_token=${codeEnc}`;
+
+    const networkStats = await GuruService.getInvitePromotersNetworkStats(guruId);
+    const earnedGbp = (Number(networkStats.earnedPence) / 100).toFixed(2);
+
+    return ok(res, req, {
+      referralCode: referral.referral_code,
+      referral_token: referral.referral_code,
+      referralLink,
+      createdAt: referral.created_at,
+      networkStats: {
+        promotersJoined: networkStats.promotersJoined,
+        ticketsSold: networkStats.ticketsSold,
+        earned: {
+          amount: earnedGbp,
+          currency: "GBP",
+        },
+      },
+      meta: {
+        statsLabel: "Live Stats",
+        footnote: "Promoters who sign up with this link join your network.",
+      },
+    });
+  } catch (err) {
+    console.error("Invite promoters referral link error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to load invite referral link");
   }
 }
 
@@ -1125,6 +1176,44 @@ async function getAttachedPromoters(req, res) {
   } catch (err) {
     console.error('Get attached promoters error:', err);
     return fail(res, req, 500, "INTERNAL_ERROR", "Failed to get attached promoters");
+  }
+}
+
+/**
+ * Promoters who joined via this Guru's public referral code (register?referral_token=CODE from guru_referrals),
+ * not the full network (excludes application-only and promoter-to-promoter token signups).
+ * GET /gurus/dashboard/promoters/referral-signups — must stay above /dashboard/promoters/:promoterId
+ */
+async function getGuruReferralSignupsPromoters(req, res) {
+  try {
+    const guruId = req.user.id;
+    const { dateFrom, dateTo, page = "1", limit = "20", search = "" } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+
+    const { rows: promoters, total } = await GuruService.getAttachedPromoters(guruId, dateFrom, dateTo, {
+      onlyGuruPublicReferralSignups: true,
+      searchByName: search,
+      page: pageNum,
+      limit: limitNum,
+      includePagination: true,
+    });
+
+    return ok(res, req, {
+      quarterWindowUtc: quarterWindowUtcBounds(),
+      filter: "guru_public_referral_link",
+      search: String(search || "").trim(),
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.ceil(total / limitNum),
+      },
+      promoters: promoters.map(mapAttachedPromoterRow),
+    });
+  } catch (err) {
+    console.error("Get guru referral signups promoters error:", err);
+    return fail(res, req, 500, "INTERNAL_ERROR", "Failed to get referral signup promoters");
   }
 }
 
@@ -1528,8 +1617,10 @@ module.exports = {
   rejectPromoterApplication,
   getDashboardSummary,
   getReferralInfo,
+  getInvitePromotersReferralLink,
   getReferralStats,
   getAttachedPromoters,
+  getGuruReferralSignupsPromoters,
   getPromoterPerformance,
   getPromoterDetails,
   getPromoterCharts,

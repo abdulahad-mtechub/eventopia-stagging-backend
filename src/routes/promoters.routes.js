@@ -92,7 +92,7 @@ router.get("/me", getMyProfile);
 router.post("/applications/:id/payments", payActivationFee);
 
 // Promoter -> Promoter referral APIs (Flow 1)
-router.post("/referral/link", requireActivePromoter, createReferralLink);
+router.get("/referral/link", requireActivePromoter, createReferralLink);
 router.get("/referrals", requireActivePromoter, listPromoterReferrals);
 
 /**

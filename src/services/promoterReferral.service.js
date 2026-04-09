@@ -11,7 +11,7 @@ const REFERRAL_PER_TICKET_PENCE = 30;
 
 function buildPromoterReferralUrl(token) {
   const base = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
-  return `${base}/register?ref=${token}`;
+  return `${base}/register?referral_token=${encodeURIComponent(token)}`;
 }
 
 function generateReferralToken() {
@@ -145,8 +145,38 @@ async function createPromoterReferralLink(referrerId) {
   }
 }
 
-async function getPromoterReferrals(promoterId) {
-  const [asReferrer, asReferred] = await Promise.all([
+async function getPromoterReferrals(promoterId, options = {}) {
+  const page = Number.isFinite(options.page) ? Math.max(1, options.page) : 1;
+  const limit = Number.isFinite(options.limit)
+    ? Math.min(100, Math.max(1, options.limit))
+    : 10;
+  const offset = (page - 1) * limit;
+  const search = (options.search || "").trim();
+
+  const referrerWhere = [
+    `pr.referrer_id = $1`,
+  ];
+  const referrerParams = [promoterId];
+
+  if (search) {
+    referrerParams.push(`%${search}%`);
+    const searchParamIdx = referrerParams.length;
+    referrerWhere.push(
+      `(u.name ILIKE $${searchParamIdx}
+        OR u.email ILIKE $${searchParamIdx}
+        OR pr.status ILIKE $${searchParamIdx}
+        OR pr.referral_link_token ILIKE $${searchParamIdx}
+        OR pr.id::text ILIKE $${searchParamIdx})`
+    );
+  }
+
+  referrerParams.push(limit, offset);
+  const limitParamIdx = referrerParams.length - 1;
+  const offsetParamIdx = referrerParams.length;
+
+  const referrerWhereSql = referrerWhere.join(" AND ");
+
+  const [asReferrer, asReferrerCount, asReferred] = await Promise.all([
     pool.query(
       `SELECT
          pr.id,
@@ -166,12 +196,22 @@ async function getPromoterReferrals(promoterId) {
            ELSE GREATEST(0, CEIL(EXTRACT(EPOCH FROM (pr.expiry_date - NOW())) / 86400.0))::int
          END AS days_remaining,
          pr.created_at,
-         u.name AS referred_name
+         u.name AS referred_name,
+         u.email AS referred_email
        FROM promoter_referrals pr
        LEFT JOIN users u ON u.id = pr.referred_id
-       WHERE pr.referrer_id = $1
-       ORDER BY pr.created_at DESC`,
-      [promoterId]
+       WHERE ${referrerWhereSql}
+       ORDER BY pr.created_at DESC
+       LIMIT $${limitParamIdx}
+       OFFSET $${offsetParamIdx}`,
+      referrerParams
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM promoter_referrals pr
+       LEFT JOIN users u ON u.id = pr.referred_id
+       WHERE ${referrerWhereSql}`,
+      referrerParams.slice(0, search ? 2 : 1)
     ),
     pool.query(
       `SELECT
@@ -191,7 +231,8 @@ async function getPromoterReferrals(promoterId) {
            ELSE GREATEST(0, CEIL(EXTRACT(EPOCH FROM (pr.expiry_date - NOW())) / 86400.0))::int
          END AS days_remaining,
          pr.created_at,
-         u.name AS referrer_name
+         u.name AS referrer_name,
+         u.email AS referrer_email
        FROM promoter_referrals pr
        LEFT JOIN users u ON u.id = pr.referrer_id
        WHERE pr.referred_id = $1
@@ -200,9 +241,21 @@ async function getPromoterReferrals(promoterId) {
     ),
   ]);
 
+  const total = asReferrerCount.rows[0]?.total || 0;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+
   return {
     asReferrer: asReferrer.rows,
     asReferred: asReferred.rows,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+      search,
+    },
   };
 }
 
