@@ -100,7 +100,14 @@ async function createApplication(req, res) {
   try {
     await client.query("BEGIN");
 
-    const { agreed_to_terms, agreed_to_promoter_agreement, agreed_to_activation_fee_terms, guru_user_id, avatar_url } = req.body;
+    const {
+      agreed_to_terms,
+      agreed_to_promoter_agreement,
+      agreed_to_activation_fee_terms,
+      guru_user_id,
+      avatar_url,
+      full_name,
+    } = req.body;
     const userId = req.user.id;
 
     // Validation
@@ -159,7 +166,7 @@ async function createApplication(req, res) {
     if (attributionResult.rowCount > 0) {
       finalGuruId = attributionResult.rows[0].guru_id;
       // Ensure guru_user_id from body matches the referred guru, or ignore body if referral exists
-      if (guru_user_id && guru_user_id !== finalGuruId) {
+      if (guru_user_id && String(guru_user_id) !== String(finalGuruId)) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           error: true,
@@ -215,21 +222,33 @@ async function createApplication(req, res) {
     );
 
     if (existingLink.rowCount > 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        error: true,
-        message: "A Guru relationship already exists for your account. Please contact support to make changes.",
-        data: null,
-      });
-    }
+      const existingGuruId = existingLink.rows[0]?.guru_user_id;
+      if (String(existingGuruId) !== String(finalGuruId)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: true,
+          message: "A Guru relationship already exists for your account. Please contact support to make changes.",
+          data: null,
+        });
+      }
 
-    await client.query(
-      `
-      INSERT INTO promoter_guru_links (promoter_user_id, guru_user_id, source)
-      VALUES ($1, $2, 'application')
-      `,
-      [userId, finalGuruId]
-    );
+      // Referral flow may pre-create promoter_guru_links; keep it and normalize metadata.
+      await client.query(
+        `UPDATE promoter_guru_links
+         SET changed_at = NOW(),
+             source = COALESCE(source, 'application')
+         WHERE promoter_user_id = $1`,
+        [userId]
+      );
+    } else {
+      await client.query(
+        `
+        INSERT INTO promoter_guru_links (promoter_user_id, guru_user_id, source)
+        VALUES ($1, $2, 'application')
+        `,
+        [userId, finalGuruId]
+      );
+    }
 
     // Get territory from Guru's Network Manager
     const territoryResult = await client.query(
@@ -244,7 +263,13 @@ async function createApplication(req, res) {
       territoryName = territoryResult.rows[0].territory_name;
     }
 
-    // Update user's avatar if provided
+    // Update user's profile fields captured during application
+    if (full_name && String(full_name).trim()) {
+      await client.query(
+        "UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2",
+        [String(full_name).trim(), userId]
+      );
+    }
     if (avatar_url) {
       await client.query(
         "UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2",

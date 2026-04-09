@@ -15,8 +15,10 @@ const {
   rejectPromoterApplication,
   getDashboardSummary,
   getReferralInfo,
+  getInvitePromotersReferralLink,
   getReferralStats,
   getAttachedPromoters,
+  getGuruReferralSignupsPromoters,
   getPromoterPerformance,
   getPromoterDetails,
   getPromoterCharts,
@@ -59,6 +61,8 @@ router.post("/activation-fee/commit", commitActivationFee);
 router.get("/me", getMyProfile);
 
 // Promoter management routes (Guru only)
+router.get("/promoters/invite/referral-link", requireGuru, getInvitePromotersReferralLink);
+router.post("/promoters/invite/referral-link", requireGuru, getInvitePromotersReferralLink);
 router.get("/promoters/applications", requireRole('guru'), listPromoterApplications);
 router.post("/promoters/:applicationId/approve", requireRole('guru'), approvePromoterApplication);
 router.post("/dashboard/promoters/:promoterId/activate", requireRole('guru'), activatePendingPromoter);
@@ -68,6 +72,7 @@ router.post("/promoters/:applicationId/reject", requireRole('guru'), rejectPromo
 router.get("/dashboard/summary", requireGuru, getDashboardSummary);
 router.get("/dashboard/referral", requireGuru, getReferralInfo);
 router.get("/dashboard/promoters", requireGuru, getAttachedPromoters);
+router.get("/dashboard/promoters/referral-signups", requireGuru, getGuruReferralSignupsPromoters);
 router.get(
   "/dashboard/promoters/:promoterId/details",
   requireGuru,

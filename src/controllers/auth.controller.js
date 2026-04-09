@@ -729,7 +729,13 @@ async function register(req, res) {
       referral_token,
       ref,
     } = req.body;
-    const promoterReferralToken = (referral_token || ref || req.query?.ref || "").trim();
+    const promoterReferralToken = (
+      referral_token ||
+      ref ||
+      req.query?.referral_token ||
+      req.query?.ref ||
+      ""
+    ).trim();
 
     // Collect exact validation errors
     const errors = [];
@@ -927,24 +933,87 @@ async function register(req, res) {
 
     const user = userResult.rows[0];
 
-    // Promoter -> Promoter referral token claim on registration.
-    // This starts the 90-day window and locks guru attribution via user_attributions.
+    // Promoter referral_token: Flow 1 (promoter_referrals) or Flow 2 (guru_referrals public code).
     if (promoterReferralToken) {
-      try {
-        await claimReferralOnRegister({
-          token: promoterReferralToken,
-          referredUserId: user.id,
-        });
-      } catch (claimErr) {
+      const flow1Check = await pool.query(
+        `SELECT 1 FROM promoter_referrals WHERE referral_link_token = $1 LIMIT 1`,
+        [promoterReferralToken]
+      );
+      if (flow1Check.rowCount > 0) {
         try {
-          await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
-        } catch (_) {}
-        const status = claimErr.status || 400;
-        return res.status(status).json({
-          error: true,
-          message: claimErr.message || "Unable to apply referral token.",
-          data: null,
-        });
+          await claimReferralOnRegister({
+            token: promoterReferralToken,
+            referredUserId: user.id,
+          });
+        } catch (claimErr) {
+          try {
+            await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
+          } catch (_) {}
+          const status = claimErr.status || 400;
+          return res.status(status).json({
+            error: true,
+            message: claimErr.message || "Unable to apply referral token.",
+            data: null,
+          });
+        }
+      } else {
+        const guruRef = await ReferralService.validateReferralCode(promoterReferralToken);
+        if (guruRef) {
+          try {
+            await ReferralService.recordSignup(promoterReferralToken, user.id);
+          } catch (signupErr) {
+            try {
+              await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
+            } catch (_) {}
+            return res.status(400).json({
+              error: true,
+              message: signupErr.message || "Unable to apply referral token.",
+              data: null,
+            });
+          }
+          // Guru public link: attach to network so dashboards / credit routing see this promoter
+          // (recordSignup only writes user_attributions + referral_events).
+          if (user.role === "promoter") {
+            const gid = guruRef.guru_id;
+            try {
+              await pool.query(
+                `INSERT INTO promoter_guru_links (promoter_user_id, guru_user_id, source, created_at, changed_at)
+                 VALUES ($1, $2, 'guru_public_referral', NOW(), NOW())
+                 ON CONFLICT (promoter_user_id) DO UPDATE
+                 SET guru_user_id = EXCLUDED.guru_user_id,
+                     source = EXCLUDED.source,
+                     changed_at = NOW()`,
+                [user.id, gid]
+              );
+              await pool.query(
+                `INSERT INTO promoter_profiles (user_id, guru_id, created_at, updated_at)
+                 VALUES ($1, $2, NOW(), NOW())
+                 ON CONFLICT (user_id) DO UPDATE
+                 SET guru_id = EXCLUDED.guru_id, updated_at = NOW()`,
+                [user.id, gid]
+              );
+            } catch (linkErr) {
+              console.error("[register] guru referral attach promoter_guru_links:", linkErr.message);
+              try {
+                await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
+              } catch (_) {}
+              return res.status(500).json({
+                error: true,
+                message: "Unable to complete referral signup. Please try again.",
+                data: null,
+              });
+            }
+          }
+        } else {
+          try {
+            await pool.query("DELETE FROM users WHERE id = $1", [user.id]);
+          } catch (_) {}
+          return res.status(400).json({
+            error: true,
+            message: "Invalid referral token.",
+            data: null,
+          });
+        }
       }
     }
 
@@ -968,6 +1037,15 @@ async function register(req, res) {
       try {
         await ensureShareableReferralLinkForPromoter(user.id);
       } catch (_) {}
+    }
+
+    // Pre-provision guru public referral code during registration so frontend can read via GET endpoint.
+    if (isGuruRequest || inviteData?.role === "guru") {
+      try {
+        await ReferralService.createReferralCode(user.id);
+      } catch (guruReferralErr) {
+        console.error("[register] ensureGuruReferralCode:", guruReferralErr.message);
+      }
     }
 
     // If user registered via invite, mark invite as used and handle special flows
@@ -3642,13 +3720,36 @@ async function guruRegisterViaInvite(req, res) {
     );
 
     // STEP 5B: Generate referral code for this guru (for promoters to use)
-    const referralCode = require('crypto').randomBytes(16).toString('hex');
-    
-    await client.query(
-      `INSERT INTO guru_referrals (guru_id, referral_code, created_at)
-       VALUES ($1, $2, NOW())`,
-      [user.id, referralCode]
+    // Keep it aligned with ReferralService format (8-char human-friendly code).
+    const existingReferral = await client.query(
+      `SELECT id FROM guru_referrals WHERE guru_id = $1 AND revoked_at IS NULL LIMIT 1`,
+      [user.id]
     );
+    if (existingReferral.rowCount === 0) {
+      let created = false;
+      let attempts = 0;
+      while (!created && attempts < 10) {
+        const referralCode = ReferralService.generateReferralCode();
+        try {
+          const insertResult = await client.query(
+            `INSERT INTO guru_referrals (guru_id, referral_code, created_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (referral_code) DO NOTHING
+             RETURNING id`,
+            [user.id, referralCode]
+          );
+          created = insertResult.rowCount > 0;
+        } catch (refErr) {
+          if (refErr && refErr.code !== "23505") {
+            throw refErr;
+          }
+        }
+        attempts++;
+      }
+      if (!created) {
+        throw new Error("Unable to create guru referral code");
+      }
+    }
 
     // console.log(`[GURU REGISTER] Committing transaction`);
     await client.query('COMMIT');

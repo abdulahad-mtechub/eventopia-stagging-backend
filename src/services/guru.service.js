@@ -284,14 +284,67 @@ class GuruService {
   }
 
   /**
+   * All-time network stats for Guru "Invite Promoters" (promoters linked, tickets sold on those events, guru credit from ledger).
+   * Scoped to events where event.guru_id matches this guru and the promoter is in promoter_guru_links for this guru.
+   * @param {number} guruId
+   * @returns {Promise<{ promotersJoined: number, ticketsSold: number, earnedPence: number }>}
+   */
+  static async getInvitePromotersNetworkStats(guruId) {
+    const promotersResult = await pool.query(
+      `SELECT COUNT(DISTINCT pgl.promoter_user_id)::int AS count
+       FROM promoter_guru_links pgl
+       WHERE pgl.guru_user_id = $1`,
+      [guruId]
+    );
+
+    const ticketsResult = await pool.query(
+      `SELECT COUNT(DISTINCT t.id)::int AS tickets_sold
+       FROM promoter_guru_links pgl
+       JOIN events e ON e.promoter_id = pgl.promoter_user_id AND e.guru_id = pgl.guru_user_id
+       JOIN tickets t ON t.event_id = e.id AND t.status = 'sold'
+       WHERE pgl.guru_user_id = $1`,
+      [guruId]
+    );
+
+    const earnedResult = await pool.query(
+      `SELECT COALESCE(SUM(cl.amount), 0)::bigint AS earned_pence
+       FROM credit_ledger cl
+       JOIN events e ON e.id = cl.event_id
+       WHERE cl.user_id = $1
+         AND cl.role = 'guru'
+         AND cl.entry_type = 'CREDIT_ALLOCATION'
+         AND e.guru_id = $1
+         AND EXISTS (
+           SELECT 1 FROM promoter_guru_links pgl
+           WHERE pgl.promoter_user_id = e.promoter_id AND pgl.guru_user_id = $1
+         )`,
+      [guruId]
+    );
+
+    return {
+      promotersJoined: parseInt(promotersResult.rows[0].count, 10) || 0,
+      ticketsSold: parseInt(ticketsResult.rows[0].tickets_sold, 10) || 0,
+      earnedPence: Number(earnedResult.rows[0].earned_pence) || 0,
+    };
+  }
+
+  /**
    * Get list of attached promoters (rich payload for guru dashboard / Figma promoter cards).
    * Metrics scoped to events where both promoter_id and guru_id match this guru–promoter pair.
    * @param {number} guruId - Guru user ID
    * @param {Date} dateFrom - Filter on link attached_at
    * @param {Date} dateTo - Filter on link attached_at
-   * @returns {Promise<Array>} Promoters list
+   * @param {{ onlyGuruPublicReferralSignups?: boolean, searchByName?: string, page?: number, limit?: number, includePagination?: boolean }} [options]
+   * @returns {Promise<Array|{rows:Array,total:number}>} Promoters list or paginated result
    */
-  static async getAttachedPromoters(guruId, dateFrom, dateTo) {
+  static async getAttachedPromoters(guruId, dateFrom, dateTo, options = {}) {
+    const {
+      onlyGuruPublicReferralSignups = false,
+      searchByName = "",
+      page = 1,
+      limit = 20,
+      includePagination = false,
+    } = options;
     const SETTLED = settledTicket.SETTLED_TICKET_CONDITIONS.replace(/\s+/g, " ").trim();
     const now = new Date();
     const q = Math.floor(now.getUTCMonth() / 3);
@@ -314,8 +367,45 @@ class GuruService {
     params.push(now.toISOString());
     const idxQuarterEnd = params.length;
 
-    const result = await pool.query(
-      `SELECT
+    const guruReferralSignupClause = onlyGuruPublicReferralSignups
+      ? ` AND (
+          EXISTS (
+            SELECT 1 FROM user_attributions ua
+            INNER JOIN guru_referrals gr ON gr.guru_id = $1
+              AND gr.referral_code = ua.referral_code
+              AND gr.revoked_at IS NULL
+            WHERE ua.user_id = u.id AND ua.guru_id = $1
+          )
+          OR EXISTS (
+            SELECT 1 FROM referral_events re
+            WHERE re.guru_id = $1
+              AND re.event_type = 'signup'
+              AND re.user_id = pgl.promoter_user_id
+          )
+        )`
+      : "";
+    const trimmedSearch = String(searchByName || "").trim();
+    const shouldSearchByName = trimmedSearch.length > 0;
+    let searchByNameClause = "";
+    if (shouldSearchByName) {
+      params.push(`%${trimmedSearch}%`);
+      searchByNameClause = ` AND u.name ILIKE $${params.length}`;
+    }
+
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const safeLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const offset = (safePage - 1) * safeLimit;
+
+    const baseFromWhere = `
+       FROM promoter_guru_links pgl
+       JOIN users u ON u.id = pgl.promoter_user_id
+      WHERE pgl.guru_user_id = $1
+            ${linkDateClause}
+            ${guruReferralSignupClause}
+            ${searchByNameClause}
+    `;
+
+    const selectSql = `SELECT
          pgl.promoter_user_id AS id,
          u.user_no,
          u.name,
@@ -381,15 +471,35 @@ class GuruService {
          (SELECT COUNT(DISTINCT e.id)::bigint
             FROM events e
            WHERE e.promoter_id = pgl.promoter_user_id AND e.guru_id = $1) AS events_count
-       FROM promoter_guru_links pgl
-       JOIN users u ON u.id = pgl.promoter_user_id
-      WHERE pgl.guru_user_id = $1
-            ${linkDateClause}
-      ORDER BY pgl.created_at DESC`,
+      ${baseFromWhere}
+      ORDER BY pgl.created_at DESC`;
+
+    const queryParams = [...params];
+    let paginationSql = "";
+    if (includePagination) {
+      queryParams.push(safeLimit);
+      const idxLimit = queryParams.length;
+      queryParams.push(offset);
+      const idxOffset = queryParams.length;
+      paginationSql = ` LIMIT $${idxLimit} OFFSET $${idxOffset}`;
+    }
+
+    const result = await pool.query(`${selectSql}${paginationSql}`, queryParams);
+
+    if (!includePagination) {
+      return result.rows;
+    }
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM (${selectSql}) AS referral_signup_promoters`,
       params
     );
 
-    return result.rows;
+    return {
+      rows: result.rows,
+      total: parseInt(countResult.rows[0]?.total || 0, 10),
+    };
   }
 
   /**
