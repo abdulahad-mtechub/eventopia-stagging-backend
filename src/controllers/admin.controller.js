@@ -1360,7 +1360,7 @@ async function listPendingApprovalEvents(req, res) {
     let paramCount = 2;
 
     if (city) {
-      conditions.push(`e.city = $${paramCount++}`);
+      conditions.push(`e.city_display = $${paramCount++}`);
       params.push(city);
     }
 
@@ -1388,10 +1388,10 @@ async function listPendingApprovalEvents(req, res) {
          e.title,
          e.description,
          e.status,
-         e.visibility_mode,
+         e.visibility AS visibility_mode,
          e.format,
          e.access_mode,
-         e.city,
+         e.city_display AS city,
          e.venue_name,
          e.start_at,
          e.end_at,

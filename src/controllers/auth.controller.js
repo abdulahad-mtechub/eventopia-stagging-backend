@@ -150,11 +150,11 @@ function mapUserForResponse(user) {
 ======================= */
 async function verifyOtpEmail(req, res) {
   try {
-    const { userId, email, otp } = req.body;
+    const { userId, email, otp, challengeId } = req.body;
 
     const errors = [];
 
-if (!userId && !email) errors.push("User ID or email is required.");
+if (!userId && !email && !challengeId) errors.push("User ID, email, or challengeId is required.");
 if (!otp) errors.push("OTP is required.");
 
 if (errors.length > 0) {
@@ -167,22 +167,54 @@ if (errors.length > 0) {
     },
   });
 }
-    // Get user by userId (handle both user_no and id) or by email
-    const userResult = userId
-      ? await pool.query(
-          `
-          SELECT * FROM users
-          WHERE id = $1 OR user_no = $1
-          `,
+    // Resolve user deterministically using one of:
+    // 1) explicit email from client, 2) challengeId -> otp email, 3) userId fallback.
+    let userResult;
+    if (email) {
+      userResult = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+    } else if (challengeId) {
+      const otpByChallenge = await pool.query(
+        `
+        SELECT email
+        FROM otps
+        WHERE id = $1
+          AND purpose = 'signup'
+        LIMIT 1
+        `,
+        [challengeId]
+      );
+      if (otpByChallenge.rowCount === 0) {
+        return res.status(400).json({
+          error: true,
+          message: "Invalid challengeId. Please request a new OTP.",
+          data: { userId: userId || null, email: null, challengeId: challengeId || null },
+        });
+      }
+      userResult = await pool.query(`SELECT * FROM users WHERE email = $1`, [otpByChallenge.rows[0].email]);
+    } else if (userId) {
+      try {
+        // Keep backward compatibility with old payload (userId + otp):
+        // treat userId primarily as public user_no, then fallback to internal id.
+        userResult = await pool.query(
+          `SELECT * FROM users WHERE user_no = $1 LIMIT 1`,
           [userId]
-        )
-      : await pool.query(
-          `
-          SELECT * FROM users
-          WHERE email = $1
-          `,
-          [email]
         );
+        if (userResult.rowCount === 0) {
+          userResult = await pool.query(
+            `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+            [userId]
+          );
+        }
+      } catch (err) {
+        if (err.code === "42703" && String(err.message || "").includes("user_no")) {
+          userResult = await pool.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [userId]);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      userResult = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+    }
 
     if (userResult.rowCount === 0) {
       return res.status(404).json({
@@ -195,18 +227,34 @@ if (errors.length > 0) {
     const user = userResult.rows[0];
 
     // Find the latest active OTP for this user's email
-    const otpResult = await pool.query(
-      `
-      SELECT * FROM otps
-      WHERE email = $1
-        AND purpose = 'signup'
-        AND consumed_at IS NULL
-        AND expires_at > NOW()
-      ORDER BY created_at DESC
-      LIMIT 1
-      `,
-      [user.email]
-    );
+    let otpResult;
+    if (challengeId) {
+      otpResult = await pool.query(
+        `
+        SELECT * FROM otps
+        WHERE id = $1
+          AND email = $2
+          AND purpose = 'signup'
+          AND consumed_at IS NULL
+          AND expires_at > NOW()
+        LIMIT 1
+        `,
+        [challengeId, user.email]
+      );
+    } else {
+      otpResult = await pool.query(
+        `
+        SELECT * FROM otps
+        WHERE email = $1
+          AND purpose = 'signup'
+          AND consumed_at IS NULL
+          AND expires_at > NOW()
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [user.email]
+      );
+    }
 
     if (otpResult.rowCount === 0) {
       return res.status(400).json({
@@ -2666,6 +2714,7 @@ async function changePasswordV1(req, res) {
  * Response: { referral_token, registration_url, email, expires_at }
  */
 async function createPromoterReferralInvite(req, res) {
+  const client = await pool.connect();
   try {
     // AUTHORIZATION: Only gurus or kings_account can create referral invites
     const allowedRoles = ['guru', 'kings_account'];
@@ -2699,7 +2748,7 @@ async function createPromoterReferralInvite(req, res) {
     }
 
     // Check if email already exists
-    const existingUser = await pool.query(
+    const existingUser = await client.query(
       "SELECT id FROM users WHERE email = $1",
       [email]
     );
@@ -2712,12 +2761,41 @@ async function createPromoterReferralInvite(req, res) {
       });
     }
 
+    await client.query("BEGIN");
+
+    // Create a pending promoter user immediately so Guru can manage/activate from dashboard
+    const pendingUserResult = await client.query(
+      `INSERT INTO users (email, name, role, status, account_status, email_status)
+       VALUES ($1, $2, 'promoter', 'active', 'pending', 'pending')
+       RETURNING id`,
+      [email, String(name || "").trim() || null]
+    );
+    const pendingPromoterUserId = pendingUserResult.rows[0].id;
+
+    await client.query(
+      `INSERT INTO promoter_guru_links (promoter_user_id, guru_user_id, source, created_at, changed_at)
+       VALUES ($1, $2, 'invite_referral', NOW(), NOW())
+       ON CONFLICT (promoter_user_id) DO UPDATE
+       SET guru_user_id = EXCLUDED.guru_user_id,
+           source = EXCLUDED.source,
+           changed_at = NOW()`,
+      [pendingPromoterUserId, guruId]
+    );
+
+    await client.query(
+      `INSERT INTO promoter_profiles (user_id, guru_id, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET guru_id = EXCLUDED.guru_id, updated_at = NOW()`,
+      [pendingPromoterUserId, guruId]
+    );
+
     // Generate referral token (UUID-like token)
     const referralToken = require('crypto').randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + expires_in_minutes * 60 * 1000);
 
     // Create referral invite record
-    const inviteResult = await pool.query(
+    const inviteResult = await client.query(
       `INSERT INTO promoter_referral_invites (email, name, referral_token, guru_user_id, kings_account_user_id, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, referral_token, expires_at, email`,
@@ -2727,7 +2805,7 @@ async function createPromoterReferralInvite(req, res) {
     const invite = inviteResult.rows[0];
 
     // Get guru name
-    const guruResult = await pool.query("SELECT name FROM users WHERE id = $1", [guruId]);
+    const guruResult = await client.query("SELECT name FROM users WHERE id = $1", [guruId]);
     const guruName = guruResult.rows[0]?.name || 'Your Guru';
 
     // Build registration URL
@@ -2747,6 +2825,8 @@ async function createPromoterReferralInvite(req, res) {
       // Continue - don't fail the API if email fails
     }
 
+    await client.query("COMMIT");
+
     // Return success response
     return res.status(201).json({
       error: false,
@@ -2763,12 +2843,15 @@ async function createPromoterReferralInvite(req, res) {
     });
 
   } catch (err) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("Create promoter referral invite error:", err);
     return res.status(500).json({
       error: true,
       message: "An error occurred while creating the referral invite.",
       data: null,
     });
+  } finally {
+    client.release();
   }
 }
 
@@ -3034,18 +3117,34 @@ async function promoterRegisterViaReferral(req, res) {
       isTimeBasedInvite = true;
     }
 
-    // STEP 2: CHECK EXISTING USER (NOW SAFE)
-    const existingUser = await client.query(
-      "SELECT id FROM users WHERE email = $1",
-      [email]
-    );
+    // STEP 2: CHECK EXISTING USER (invite flow can pre-create pending promoter user)
+    let invitedPendingUserId = null;
+    if (isTimeBasedInvite) {
+      const pendingUserResult = await client.query(
+        `SELECT id, account_status
+         FROM users
+         WHERE email = $1
+         ORDER BY created_at ASC
+         LIMIT 1`,
+        [email]
+      );
 
-    if (existingUser.rowCount > 0) {
-      client.release();
-      return res.status(409).json({
-        error: true,
-        message: "Email is already registered.",
-      });
+      if (pendingUserResult.rowCount > 0) {
+        invitedPendingUserId = pendingUserResult.rows[0].id;
+      }
+    } else {
+      const existingUser = await client.query(
+        "SELECT id FROM users WHERE email = $1",
+        [email]
+      );
+
+      if (existingUser.rowCount > 0) {
+        client.release();
+        return res.status(409).json({
+          error: true,
+          message: "Email is already registered.",
+        });
+      }
     }
 
     // STEP 3: CREATE USER
@@ -3053,14 +3152,33 @@ async function promoterRegisterViaReferral(req, res) {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const userResult = await client.query(
-      `INSERT INTO users (email, password_hash, name, phone, role, status, account_status, email_status, email_verified_at)
-       VALUES ($1, $2, $3, $4, 'promoter', 'active', 'active', 'verified', NOW())
-       RETURNING *`,
-      [email, passwordHash, name.trim(), phone]
-    );
-
-    const user = userResult.rows[0];
+    let user;
+    if (invitedPendingUserId) {
+      const updatedUserResult = await client.query(
+        `UPDATE users
+         SET password_hash = $1,
+             name = $2,
+             phone = $3,
+             role = 'promoter',
+             status = 'active',
+             account_status = 'active',
+             email_status = 'verified',
+             email_verified_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $4
+         RETURNING *`,
+        [passwordHash, name.trim(), phone, invitedPendingUserId]
+      );
+      user = updatedUserResult.rows[0];
+    } else {
+      const userResult = await client.query(
+        `INSERT INTO users (email, password_hash, name, phone, role, status, account_status, email_status, email_verified_at)
+         VALUES ($1, $2, $3, $4, 'promoter', 'active', 'active', 'verified', NOW())
+         RETURNING *`,
+        [email, passwordHash, name.trim(), phone]
+      );
+      user = userResult.rows[0];
+    }
 
     // STEP 4: LINK GURU
     if (guruId) {
@@ -3719,26 +3837,31 @@ async function guruRegisterViaInvite(req, res) {
       [inviteData.id]
     );
 
-    // STEP 5B: Generate referral code for this guru (for promoters to use)
-    // Keep it aligned with ReferralService format (8-char human-friendly code).
+    // STEP 5B: Ensure guru has a referral code (for promoters). Expose in response — must be outer-scoped.
+    let referralCode = null;
     const existingReferral = await client.query(
-      `SELECT id FROM guru_referrals WHERE guru_id = $1 AND revoked_at IS NULL LIMIT 1`,
+      `SELECT referral_code FROM guru_referrals WHERE guru_id = $1 AND revoked_at IS NULL LIMIT 1`,
       [user.id]
     );
-    if (existingReferral.rowCount === 0) {
+    if (existingReferral.rowCount > 0) {
+      referralCode = existingReferral.rows[0].referral_code;
+    } else {
       let created = false;
       let attempts = 0;
       while (!created && attempts < 10) {
-        const referralCode = ReferralService.generateReferralCode();
+        const code = ReferralService.generateReferralCode();
         try {
           const insertResult = await client.query(
             `INSERT INTO guru_referrals (guru_id, referral_code, created_at)
              VALUES ($1, $2, NOW())
              ON CONFLICT (referral_code) DO NOTHING
              RETURNING id`,
-            [user.id, referralCode]
+            [user.id, code]
           );
-          created = insertResult.rowCount > 0;
+          if (insertResult.rowCount > 0) {
+            referralCode = code;
+            created = true;
+          }
         } catch (refErr) {
           if (refErr && refErr.code !== "23505") {
             throw refErr;

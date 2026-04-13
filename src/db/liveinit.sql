@@ -11,7 +11,6 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
    ================================ */
 CREATE TABLE IF NOT EXISTS users (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  user_no SERIAL UNIQUE, -- Public-facing id for API (OTP verify uses id OR user_no)
   email CITEXT UNIQUE NOT NULL,
   password_hash TEXT, -- For email/password signups
   email_verified_at TIMESTAMP,
@@ -40,8 +39,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_oauth_provider_id
 ON users(oauth_provider, oauth_id);
 
--- DBs created before user_no existed (auth uses WHERE id = $1 OR user_no = $1)
-ALTER TABLE users ADD COLUMN IF NOT EXISTS user_no SERIAL UNIQUE;
+
 
 /* ================================
    Roles table
@@ -291,80 +289,6 @@ BEGIN
   END IF;
 END $$;
 
-/* Territories: must exist before events (events.territory_id FK) */
-CREATE TABLE IF NOT EXISTS territories (
-  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE, -- City/region name (e.g., "London", "Birmingham")
-  country TEXT NOT NULL DEFAULT 'UK',
-  geoname_id BIGINT, -- GeoNames ID for reference
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_territories_name ON territories(name);
-CREATE INDEX IF NOT EXISTS idx_territories_active ON territories(is_active);
-
-/* Promoter profiles (escrow_liabilities.promoter_id FK; auth inserts by user_id) */
-CREATE TABLE IF NOT EXISTS promoter_profiles (
-  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  guru_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-  territory_id BIGINT REFERENCES territories(id) ON DELETE SET NULL,
-  ticket_count_settled INT NOT NULL DEFAULT 0,
-  unlock_status TEXT,
-  unlock_date DATE,
-  annual_cycle_start DATE,
-  current_threshold INT,
-  year_number INT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_promoter_profiles_user ON promoter_profiles(user_id);
-CREATE INDEX IF NOT EXISTS idx_promoter_profiles_guru ON promoter_profiles(guru_id);
-CREATE INDEX IF NOT EXISTS idx_promoter_profiles_territory ON promoter_profiles(territory_id);
-
-/* Networks + guru_profiles (from core migration; guru invite registration INSERTs guru_profiles) */
-ALTER TABLE users ADD COLUMN IF NOT EXISTS territory_id BIGINT REFERENCES territories(id) ON DELETE SET NULL;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS guru_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
-
-CREATE TABLE IF NOT EXISTS networks (
-  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  territory_id BIGINT REFERENCES territories(id) ON DELETE SET NULL,
-  network_manager_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-  name TEXT NOT NULL,
-  brand_identity TEXT,
-  status TEXT NOT NULL DEFAULT 'active',
-  licence_fee_amount BIGINT DEFAULT 0,
-  licence_cleared_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_networks_territory ON networks(territory_id);
-CREATE INDEX IF NOT EXISTS idx_networks_network_manager ON networks(network_manager_id);
-CREATE INDEX IF NOT EXISTS idx_networks_status ON networks(status);
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS network_id BIGINT REFERENCES networks(id) ON DELETE SET NULL;
-
-CREATE TABLE IF NOT EXISTS guru_profiles (
-  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  network_id BIGINT REFERENCES networks(id) ON DELETE SET NULL,
-  level TEXT,
-  licence_balance BIGINT DEFAULT 0,
-  licence_cleared_at TIMESTAMPTZ,
-  l3_granted_at TIMESTAMPTZ,
-  l3_retention_ticket_count INT DEFAULT 0,
-  quarterly_refund_rate NUMERIC(5,4),
-  contract_start_date DATE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_guru_profiles_user ON guru_profiles(user_id);
-CREATE INDEX IF NOT EXISTS idx_guru_profiles_network ON guru_profiles(network_id);
-
 CREATE TABLE IF NOT EXISTS events (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   promoter_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
@@ -509,62 +433,29 @@ CREATE TABLE IF NOT EXISTS ticket_types (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Add constraint: reveal_rule only for ONLINE_LIVE (IF NOT EXISTS on ADD CONSTRAINT requires PG15+)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    WHERE n.nspname = 'public' AND t.relname = 'ticket_types'
-      AND c.conname = 'chk_reveal_rule_for_online_live'
-  ) THEN
-    ALTER TABLE ticket_types
-    ADD CONSTRAINT chk_reveal_rule_for_online_live
-    CHECK (
-      (access_mode = 'ONLINE_LIVE' AND reveal_rule IS NOT NULL) OR
-      (access_mode != 'ONLINE_LIVE' AND reveal_rule IS NULL)
-    );
-  END IF;
-END $$;
+-- Add constraint: reveal_rule only for ONLINE_LIVE
+ALTER TABLE ticket_types
+ADD CONSTRAINT IF NOT EXISTS chk_reveal_rule_for_online_live
+CHECK (
+  (access_mode = 'ONLINE_LIVE' AND reveal_rule IS NOT NULL) OR
+  (access_mode != 'ONLINE_LIVE' AND reveal_rule IS NULL)
+);
 
 -- Add constraint: on-demand windows only for ON_DEMAND
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    WHERE n.nspname = 'public' AND t.relname = 'ticket_types'
-      AND c.conname = 'chk_on_demand_window'
-  ) THEN
-    ALTER TABLE ticket_types
-    ADD CONSTRAINT chk_on_demand_window
-    CHECK (
-      (access_mode = 'ON_DEMAND' AND on_demand_start_at IS NOT NULL AND on_demand_end_at IS NOT NULL) OR
-      (access_mode != 'ON_DEMAND' AND (on_demand_start_at IS NULL AND on_demand_end_at IS NULL))
-    );
-  END IF;
-END $$;
+ALTER TABLE ticket_types
+ADD CONSTRAINT IF NOT EXISTS chk_on_demand_window
+CHECK (
+  (access_mode = 'ON_DEMAND' AND on_demand_start_at IS NOT NULL AND on_demand_end_at IS NOT NULL) OR
+  (access_mode != 'ON_DEMAND' AND (on_demand_start_at IS NULL AND on_demand_end_at IS NULL))
+);
 
 -- Add constraint: on-demand window must be before end
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    WHERE n.nspname = 'public' AND t.relname = 'ticket_types'
-      AND c.conname = 'chk_on_demand_window_order'
-  ) THEN
-    ALTER TABLE ticket_types
-    ADD CONSTRAINT chk_on_demand_window_order
-    CHECK (
-      on_demand_start_at IS NULL OR on_demand_end_at IS NULL OR
-      on_demand_start_at < on_demand_end_at
-    );
-  END IF;
-END $$;
+ALTER TABLE ticket_types
+ADD CONSTRAINT IF NOT EXISTS chk_on_demand_window_order
+CHECK (
+  on_demand_start_at IS NULL OR on_demand_end_at IS NULL OR
+  on_demand_start_at < on_demand_end_at
+);
 
 CREATE INDEX IF NOT EXISTS idx_ticket_types_event_sort ON ticket_types(event_id, sort_order);
 
@@ -587,6 +478,23 @@ CREATE INDEX IF NOT EXISTS idx_ticket_validation_logs_event_id ON ticket_validat
 CREATE INDEX IF NOT EXISTS idx_ticket_validation_logs_ticket_id ON ticket_validation_logs(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_validation_logs_scanned_at ON ticket_validation_logs(scanned_at);
 CREATE INDEX IF NOT EXISTS idx_ticket_validation_logs_result_status ON ticket_validation_logs(result_status);
+
+/* ================================
+   Territories table (Optional - for caching if needed)
+   Note: Territories are fetched directly from GeoNames API
+   ================================ */
+CREATE TABLE IF NOT EXISTS territories (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE, -- City/region name (e.g., "London", "Birmingham")
+  country TEXT NOT NULL DEFAULT 'UK',
+  geoname_id BIGINT, -- GeoNames ID for reference
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_territories_name ON territories(name);
+CREATE INDEX IF NOT EXISTS idx_territories_active ON territories(is_active);
 
 /* ================================
    Network Manager Applications table
@@ -1311,35 +1219,13 @@ CREATE INDEX IF NOT EXISTS idx_access_tokens_ticket ON access_tokens(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_access_tokens_active ON access_tokens(event_id, revoked_at) WHERE revoked_at IS NULL;
 
 -- Constraints
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    WHERE n.nspname = 'public' AND t.relname = 'access_tokens'
-      AND c.conname = 'chk_token_not_expired'
-  ) THEN
-    ALTER TABLE access_tokens
-    ADD CONSTRAINT chk_token_not_expired
-    CHECK (expires_at > created_at);
-  END IF;
-END $$;
+ALTER TABLE access_tokens
+ADD CONSTRAINT IF NOT EXISTS chk_token_not_expired
+CHECK (expires_at > created_at);
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    WHERE n.nspname = 'public' AND t.relname = 'access_tokens'
-      AND c.conname = 'chk_token_version_positive'
-  ) THEN
-    ALTER TABLE access_tokens
-    ADD CONSTRAINT chk_token_version_positive
-    CHECK (version_at_issue > 0);
-  END IF;
-END $$;
+ALTER TABLE access_tokens
+ADD CONSTRAINT IF NOT EXISTS chk_token_version_positive
+CHECK (version_at_issue > 0);
 
 -- ==========================================
 -- CHARITY POT SYSTEM (Phase 9)

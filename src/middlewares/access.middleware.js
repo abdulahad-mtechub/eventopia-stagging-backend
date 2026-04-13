@@ -52,11 +52,11 @@ async function checkEventRequiresAccess(req, res, next) {
     const { pool } = require('../db/index');
 
     const result = await pool.query(
-      `SELECT e.visibility_mode, COUNT(*) as hidden_count
+      `SELECT e.visibility AS visibility_mode, COUNT(*)::int as hidden_count
        FROM events e
        LEFT JOIN ticket_types tt ON tt.event_id = e.id AND tt.visibility = 'hidden'
        WHERE e.id = $1
-       GROUP BY e.id, e.visibility_mode`,
+       GROUP BY e.id, e.visibility`,
       [eventId]
     );
 
