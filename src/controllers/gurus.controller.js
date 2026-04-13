@@ -76,6 +76,54 @@ function mapAttachedPromoterRow(p) {
     joinedAt: p.attached_at,
   };
 }
+
+function mapPendingPromoterInviteRow(invite) {
+  const displayName = String(invite.name || "").trim() || "Invited promoter";
+
+  return {
+    promoterId: invite.id,
+    userNo: null,
+    name: displayName,
+    email: invite.email,
+    avatarUrl: null,
+    accountStatus: "pending",
+    isInviteOnly: true,
+    invite: {
+      id: invite.id,
+      expiresAt: invite.expires_at,
+      status: "pending_registration",
+    },
+    link: {
+      source: "invite_referral",
+      attachedAt: invite.created_at,
+    },
+    referral: {
+      currentMode: "normal",
+      isReferralModeActive: false,
+      signedUpViaReferral: false,
+      fromReferralLink: false,
+      referralWindowExpiresAt: invite.expires_at,
+    },
+    credits: {
+      currency: "GBP",
+      guruCreditLedgerConfirmedGbp: 0,
+      guruCreditLedgerProjectedGbp: 0,
+      guruCommissionsRecordedTotalGbp: 0,
+    },
+    stats: {
+      ticketsSold: 0,
+      grossSalesPence: 0,
+      grossSalesGbp: 0,
+      sprintContributionSettledTicketsThisUtcQuarter: 0,
+      refundsCountThisUtcQuarter: 0,
+      refundRatePercentThisUtcQuarter: 0,
+      eventsCount: 0,
+    },
+    ticketsSold: 0,
+    grossSales: 0,
+    joinedAt: invite.created_at,
+  };
+}
 const ReferralService = require("../services/referral.service");
 const CommissionService = require("../services/commission.service");
 const { ensurePromoterCreditWallet } = require("../services/promoterCreditWallet.service");
@@ -807,8 +855,8 @@ async function activatePendingPromoter(req, res) {
     await client.query("BEGIN");
 
     const guruId = req.user.id;
-    const promoterId = parseInt(req.params.promoterId, 10);
-    if (!Number.isFinite(promoterId) || promoterId <= 0) {
+    const requestedPromoterId = parseInt(req.params.promoterId, 10);
+    if (!Number.isFinite(requestedPromoterId) || requestedPromoterId <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         error: true,
@@ -817,13 +865,44 @@ async function activatePendingPromoter(req, res) {
       });
     }
 
-    const userResult = await client.query(
-      `SELECT id, user_no, email, name, role, account_status
-       FROM users
-       WHERE id = $1
+    let resolvedPromoterId = requestedPromoterId;
+    let inviteOnlyActivation = false;
+
+    // Invite rows in dashboard use invite.id, so first resolve invite -> pending user.
+    const inviteResult = await client.query(
+      `SELECT email
+       FROM promoter_referral_invites
+       WHERE id = $1 AND guru_user_id = $2 AND used_at IS NULL
        LIMIT 1`,
-      [promoterId]
+      [requestedPromoterId, guruId]
     );
+
+    let userResult;
+    if (inviteResult.rowCount > 0) {
+      const pendingUserByInvite = await client.query(
+        `SELECT id, user_no, email, name, role, account_status
+         FROM users
+         WHERE email = $1
+         ORDER BY created_at ASC
+         LIMIT 1`,
+        [inviteResult.rows[0].email]
+      );
+      if (pendingUserByInvite.rowCount > 0) {
+        userResult = pendingUserByInvite;
+        resolvedPromoterId = pendingUserByInvite.rows[0].id;
+        inviteOnlyActivation = true;
+      } else {
+        userResult = { rowCount: 0, rows: [] };
+      }
+    } else {
+      userResult = await client.query(
+        `SELECT id, user_no, email, name, role, account_status
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [resolvedPromoterId]
+      );
+    }
     if (userResult.rowCount === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({
@@ -835,8 +914,8 @@ async function activatePendingPromoter(req, res) {
     const promoter = userResult.rows[0];
 
     const linkResult = await client.query(
-      `SELECT guru_user_id FROM promoter_guru_links WHERE promoter_user_id = $1 LIMIT 1`,
-      [promoterId]
+      `SELECT guru_user_id, source FROM promoter_guru_links WHERE promoter_user_id = $1 LIMIT 1`,
+      [resolvedPromoterId]
     );
     if (linkResult.rowCount === 0 || Number(linkResult.rows[0].guru_user_id) !== Number(guruId)) {
       await client.query("ROLLBACK");
@@ -853,20 +932,24 @@ async function activatePendingPromoter(req, res) {
        WHERE user_id = $1
        ORDER BY created_at DESC
        LIMIT 1`,
-      [promoterId]
+      [resolvedPromoterId]
     );
 
+    const isInviteLinked = String(linkResult.rows[0]?.source || "").toLowerCase() === "invite_referral";
+
     if (appResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        error: true,
-        message: "No promoter application found for this user.",
-        data: null,
-      });
+      if (!inviteOnlyActivation && !isInviteLinked) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          error: true,
+          message: "No promoter application found for this user.",
+          data: null,
+        });
+      }
     }
 
-    const application = appResult.rows[0];
-    if (application.account_status === "rejected") {
+    const application = appResult.rows[0] || null;
+    if (application && application.account_status === "rejected") {
       await client.query("ROLLBACK");
       return res.status(400).json({
         error: true,
@@ -876,13 +959,19 @@ async function activatePendingPromoter(req, res) {
     }
 
     if (String(promoter.account_status || "").toLowerCase() === "active") {
-      await ensurePromoterCreditWallet(client, promoterId);
+      await ensurePromoterCreditWallet(client, resolvedPromoterId);
+      await client.query(
+        `UPDATE promoter_referral_invites
+         SET used_at = NOW(), updated_at = NOW()
+         WHERE guru_user_id = $1 AND email = $2 AND used_at IS NULL`,
+        [guruId, promoter.email]
+      );
       await client.query("COMMIT");
       return res.json({
         error: false,
         message: "Promoter is already active.",
         data: {
-          application: { id: application.id, accountStatus: "approved" },
+          application: application ? { id: application.id, accountStatus: "approved" } : null,
           user: {
             userId: promoter.user_no ?? promoter.id,
             email: promoter.email,
@@ -894,31 +983,39 @@ async function activatePendingPromoter(req, res) {
       });
     }
 
-    await client.query(
-      `UPDATE promoter_applications
-       SET account_status = 'approved', reviewed_by = $1, reviewed_at = NOW()
-       WHERE id = $2`,
-      [guruId, application.id]
-    );
+    if (application) {
+      await client.query(
+        `UPDATE promoter_applications
+         SET account_status = 'approved', reviewed_by = $1, reviewed_at = NOW()
+         WHERE id = $2`,
+        [guruId, application.id]
+      );
+    }
 
     const promoted = await client.query(
       `UPDATE users
        SET role = 'promoter', account_status = 'active', roles_version = roles_version + 1
        WHERE id = $1
        RETURNING user_no, email, name, roles_version`,
-      [promoterId]
+      [resolvedPromoterId]
     );
 
-    await ensurePromoterCreditWallet(client, promoterId);
+    await ensurePromoterCreditWallet(client, resolvedPromoterId);
+    await client.query(
+      `UPDATE promoter_referral_invites
+       SET used_at = NOW(), updated_at = NOW()
+       WHERE guru_user_id = $1 AND email = $2 AND used_at IS NULL`,
+      [guruId, promoted.rows[0].email]
+    );
 
     await client.query("COMMIT");
     return res.json({
       error: false,
       message: "Promoter activated successfully.",
       data: {
-        application: { id: application.id, accountStatus: "approved" },
+        application: application ? { id: application.id, accountStatus: "approved" } : null,
         user: {
-          userId: promoted.rows[0].user_no ?? promoterId,
+          userId: promoted.rows[0].user_no ?? resolvedPromoterId,
           email: promoted.rows[0].email,
           name: promoted.rows[0].name,
           role: "promoter",
@@ -1165,13 +1262,45 @@ async function getReferralStats(req, res) {
 async function getAttachedPromoters(req, res) {
   try {
     const guruId = req.user.id;
-    const { dateFrom, dateTo } = req.query;
+    const { dateFrom, dateTo, page = "1", limit = "20", search = "" } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const normalizedSearch = String(search || "").trim().toLowerCase();
 
-    const promoters = await GuruService.getAttachedPromoters(guruId, dateFrom, dateTo);
+    const [promoters, pendingInvites] = await Promise.all([
+      GuruService.getAttachedPromoters(guruId, dateFrom, dateTo),
+      GuruService.getPendingPromoterInvites(guruId, dateFrom, dateTo),
+    ]);
+    const mergedPromoters = [
+      ...promoters.map(mapAttachedPromoterRow),
+      ...pendingInvites.map(mapPendingPromoterInviteRow),
+    ];
+
+    const filteredPromoters = normalizedSearch
+      ? mergedPromoters.filter((p) =>
+        String(p.name || "").toLowerCase().includes(normalizedSearch)
+      )
+      : mergedPromoters;
+
+    const sortedPromoters = filteredPromoters.sort((a, b) => {
+      const aTs = new Date(a.joinedAt || 0).getTime() || 0;
+      const bTs = new Date(b.joinedAt || 0).getTime() || 0;
+      return bTs - aTs;
+    });
+    const total = sortedPromoters.length;
+    const start = (pageNum - 1) * limitNum;
+    const pagedPromoters = sortedPromoters.slice(start, start + limitNum);
 
     return ok(res, req, {
       quarterWindowUtc: quarterWindowUtcBounds(),
-      promoters: promoters.map(mapAttachedPromoterRow),
+      search: String(search || "").trim(),
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.ceil(total / limitNum),
+      },
+      promoters: pagedPromoters,
     });
   } catch (err) {
     console.error('Get attached promoters error:', err);

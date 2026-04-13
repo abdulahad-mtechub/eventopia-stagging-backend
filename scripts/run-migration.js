@@ -23,7 +23,12 @@ async function run() {
     await pool.query(sql);
     console.log("Migration completed successfully.");
   } catch (err) {
-    console.error("Migration failed:", err.message);
+    const msg =
+      err?.message ||
+      (err?.code ? `${err.code}: ${err}` : String(err));
+    console.error("Migration failed:", msg);
+    if (err?.errors?.length) err.errors.forEach((e) => console.error(" ", e.message || e));
+    if (err?.stack) console.error(err.stack);
     process.exit(1);
   } finally {
     await pool.end();

@@ -105,8 +105,8 @@ async function createEvent(req, res) {
       `INSERT INTO events (
          promoter_id, guru_id, network_manager_id, territory_id,
          title, description, start_at, end_at, timezone,
-         format, access_mode, visibility_mode, share_token,
-         city, venue_name, venue_address, lat, lng,
+         format, access_mode, visibility, share_token,
+         city_display, venue_name, venue_address, lat, lng,
          category_id, status, ticketing_required
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'draft', true)
@@ -186,7 +186,7 @@ async function updateEvent(req, res) {
 
     // Check ownership
     const checkResult = await client.query(
-      `SELECT status, visibility_mode, share_token FROM events WHERE id = $1 AND promoter_id = $2`,
+      `SELECT status, visibility, share_token FROM events WHERE id = $1 AND promoter_id = $2`,
       [eventId, promoterId]
     );
 
@@ -220,8 +220,8 @@ async function updateEvent(req, res) {
     if (timezone !== undefined) addField("timezone", timezone);
     if (format !== undefined) addField("format", format);
     if (accessMode !== undefined) addField("access_mode", accessMode);
-    if (visibilityMode !== undefined) addField("visibility_mode", visibilityMode);
-    if (city !== undefined) addField("city", city);
+    if (visibilityMode !== undefined) addField("visibility", visibilityMode);
+    if (city !== undefined) addField("city_display", city);
     if (venueName !== undefined) addField("venue_name", venueName);
     if (venueAddress !== undefined) addField("venue_address", venueAddress);
     if (lat !== undefined) addField("lat", lat);
@@ -457,7 +457,7 @@ async function getEventSubmissionMissingFields(client, event, eventId) {
   if (!event.description) missingFields.push("description");
   if (!event.start_at) missingFields.push("startAt");
   if (!event.end_at) missingFields.push("endAt");
-  if (!event.city) missingFields.push("city");
+  if (!event.city_display) missingFields.push("city");
   if (!event.format) missingFields.push("format");
   if (!event.access_mode) missingFields.push("accessMode");
 
@@ -487,7 +487,7 @@ async function submitEvent(req, res) {
     await client.query("BEGIN");
 
     const eventResult = await client.query(
-      `SELECT status, title, description, start_at, end_at, city, format, access_mode, venue_name, venue_address, cover_image_url
+      `SELECT status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url
        FROM events WHERE id = $1 AND promoter_id = $2`,
       [eventId, req.user.id]
     );
@@ -554,7 +554,7 @@ async function publishEvent(req, res) {
     await client.query("BEGIN");
 
     const eventResult = await client.query(
-      `SELECT status, title, description, start_at, end_at, city, format, access_mode, venue_name, venue_address, cover_image_url
+      `SELECT status, title, description, start_at, end_at, city_display, format, access_mode, venue_name, venue_address, cover_image_url
        FROM events WHERE id = $1 AND promoter_id = $2`,
       [eventId, req.user.id]
     );
@@ -775,12 +775,13 @@ async function getPromoterEvents(req, res) {
   const total = parseInt(countResult.rows[0].total, 10);
 
   const eventsQuery = `
-    SELECT e.id, e.title, e.status, e.visibility_mode, e.start_at as "startAt",
-           e.end_at as "endAt", e.city, e.venue_name as "venueName",
+    SELECT e.id, e.title, e.status, e.visibility AS "visibility_mode", e.start_at as "startAt",
+           e.end_at as "endAt", e.city_display AS city, e.venue_name as "venueName",
            e.format, e.access_mode, e.cover_image_url as "coverImageUrl",
            e.gallery_image_urls as "galleryImageUrls", e.tickets_sold,
            (SELECT SUM(tt.capacity_total)::int FROM ticket_types tt WHERE tt.event_id = e.id) AS "capacityTotal",
-           e.views_count, e.published_at as "publishedAt", e.share_token
+           (SELECT COUNT(*)::int FROM event_views ev WHERE ev.event_id = e.id) AS "views_count",
+           e.published_at as "publishedAt", e.share_token
     FROM events e ${whereClause}
     ORDER BY ${orderBy}
     LIMIT $${paramCount} OFFSET $${paramCount + 1}
@@ -832,6 +833,10 @@ async function getPromoterEventDetail(req, res) {
   );
 
   event.tags = tagsResult.rows;
+
+  // API / older docs use visibility_mode + city; DB columns are visibility + city_display
+  event.visibility_mode = event.visibility;
+  event.city = event.city_display ?? event.city;
 
   // Get ticket types with availability
   const ticketTypesResult = await pool.query(
@@ -906,12 +911,12 @@ async function getEventsList(req, res) {
     const offset = (pageNum - 1) * pageSizeNum;
 
     // Build WHERE conditions
-    const conditions = [`e.status = '${BUYER_VISIBLE_EVENT_STATUS}'`, "e.visibility_mode = 'public'"];
+    const conditions = [`e.status = '${BUYER_VISIBLE_EVENT_STATUS}'`, "e.visibility = 'public'"];
     const params = [];
     let paramCount = 1;
 
     if (city) {
-      conditions.push(`e.city = $${paramCount++}`);
+      conditions.push(`e.city_display = $${paramCount++}`);
       params.push(city);
     }
 
@@ -984,7 +989,7 @@ async function getEventsList(req, res) {
         e.title,
         e.start_at as "startAt",
         e.end_at as "endAt",
-        e.city,
+        e.city_display AS city,
         e.venue_name as "venueName",
         e.format,
         e.access_mode,
@@ -1162,7 +1167,7 @@ async function getEventDetail(req, res) {
         startAt: event.start_at,
         endAt: event.end_at,
         timezone: event.timezone,
-        city: event.city,
+        city: event.city_display ?? event.city,
         venueName: event.venue_name,
         venueAddress: event.venue_address,
         format: event.format,
@@ -1199,7 +1204,7 @@ async function getEventByShareToken(req, res) {
         u.name as promoter_name
        FROM events e
        LEFT JOIN users u ON u.id = e.promoter_id
-       WHERE e.share_token = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility_mode = 'private_link'`,
+       WHERE e.share_token = $1 AND e.status = '${BUYER_VISIBLE_EVENT_STATUS}' AND e.visibility = 'private_link'`,
       [shareToken]
     );
 
@@ -1284,7 +1289,7 @@ async function getEventByShareToken(req, res) {
         startAt: event.start_at,
         endAt: event.end_at,
         timezone: event.timezone,
-        city: event.city,
+        city: event.city_display ?? event.city,
         venueName: event.venue_name,
         venueAddress: event.venue_address,
         format: event.format,
@@ -1314,7 +1319,9 @@ async function getEventPerformance(req, res) {
   const eventId = validateEventId(req.params.eventId);
 
   const eventResult = await pool.query(
-    `SELECT tickets_sold, views_count FROM events WHERE id = $1`,
+    `SELECT e.tickets_sold,
+            (SELECT COUNT(*)::int FROM event_views ev WHERE ev.event_id = e.id) AS views_count
+     FROM events e WHERE e.id = $1`,
     [eventId]
   );
 

@@ -503,6 +503,52 @@ class GuruService {
   }
 
   /**
+   * Get pending invite-only promoters created by Guru invite flow.
+   * These records are not registered users yet, so they do not exist in promoter_guru_links.
+   * @param {number} guruId - Guru user ID
+   * @param {Date} dateFrom - Filter on invite created_at
+   * @param {Date} dateTo - Filter on invite created_at
+   * @returns {Promise<Array>} Pending invite list
+   */
+  static async getPendingPromoterInvites(guruId, dateFrom, dateTo) {
+    const params = [guruId];
+    let whereClause = `WHERE pri.guru_user_id = $1
+      AND pri.used_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM users u
+        JOIN promoter_guru_links pgl ON pgl.promoter_user_id = u.id
+        WHERE u.email = pri.email
+          AND pgl.guru_user_id = pri.guru_user_id
+          AND COALESCE(u.account_status, '') = 'active'
+      )`;
+
+    if (dateFrom) {
+      params.push(dateFrom);
+      whereClause += ` AND pri.created_at >= $${params.length}`;
+    }
+    if (dateTo) {
+      params.push(dateTo);
+      whereClause += ` AND pri.created_at <= $${params.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT
+         pri.id,
+         pri.name,
+         pri.email,
+         pri.created_at,
+         pri.expires_at
+       FROM promoter_referral_invites pri
+       ${whereClause}
+       ORDER BY pri.created_at DESC`,
+      params
+    );
+
+    return result.rows;
+  }
+
+  /**
    * Get performance data for a specific promoter
    * @param {number} guruId - Guru user ID
    * @param {number} promoterId - Promoter user ID
